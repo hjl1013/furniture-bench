@@ -7,6 +7,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str)
     parser.add_argument("--data-path", type=str)
+    parser.add_argument("--use-perception", action="store_true")
     args = parser.parse_args()
 
     if args.data_dir is not None:
@@ -20,3 +21,9 @@ if __name__ == "__main__":
     with open(file, "rb") as f:
         data = pickle.load(f)
         print(data['observations'][0].keys())
+        print(data['observations'][0]['parts_poses'])
+
+    if args.use_perception:
+        raise NotImplementedError("Perception is not supported yet.")
+    else:
+        states = {}
