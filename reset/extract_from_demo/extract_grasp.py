@@ -215,14 +215,15 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Extract grasp pose statistics from demonstrations")
     parser.add_argument("--dataset", required=True, help="Path to a dataset directory or a single pickle file")
     parser.add_argument("--furniture", default=None, help="Override furniture name (otherwise taken from dataset)")
-    parser.add_argument("--distance-threshold", type=float, default=0.3, help="Maximum distance (m) between EE and part to consider a grasp")
+    parser.add_argument("--distance-threshold", type=float, default=0.6, help="Maximum distance (m) between EE and part to consider a grasp")
     parser.add_argument("--gripper-close-threshold", type=float, default=None, help="Absolute threshold (m) for gripper width when considered closed")
     parser.add_argument("--gripper-close-ratio", type=float, default=0.6, help="Ratio of max gripper width used when threshold is not provided")
     parser.add_argument("--velocity-difference-threshold", type=float, default=0.02, help="Maximum difference between EE and part speeds when detecting a grasp")
     parser.add_argument("--min-part-speed", type=float, default=0.005, help="Minimum part speed (m) to treat as moving together with the EE")
-    parser.add_argument("--min-consecutive-steps", type=int, default=2, help="Number of consecutive frames satisfying heuristics before logging a grasp")
+    parser.add_argument("--min-consecutive-steps", type=int, default=1, help="Number of consecutive frames satisfying heuristics before logging a grasp")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to save the statistics as JSON")
     parser.add_argument("--render", action="store_true", help="Render sampled grasp poses based on computed statistics")
+    parser.add_argument("--render-video", action="store_true", help="Render video of the demonstrations")
     parser.add_argument("--render-part", default=None, help="Name of a specific part to render (defaults to all)")
     parser.add_argument("--render-furniture", default=None, help="Furniture name to render (defaults to stats furniture)")
     parser.add_argument("--render-samples", type=int, default=5, help="Number of random samples to visualize per part")
@@ -441,6 +442,143 @@ def _render_from_summary(
         )
 
 
+def _detect_grasp_labels(
+    observations: List[Dict],
+    part_names: List[str],
+    thresholds: Dict[str, float],
+    robot_from_april: np.ndarray,
+) -> List[List[str]]:
+    num_parts = len(part_names)
+    labels: List[List[str]] = [[] for _ in range(len(observations))]
+
+    prev_part_positions = {idx: None for idx in range(num_parts)}
+    prev_ee_pos = None
+    consecutive_counters = {idx: 0 for idx in range(num_parts)}
+
+    for step_idx, obs in enumerate(observations):
+        robot_state = obs.get("robot_state")
+        parts_poses = obs.get("parts_poses")
+        if robot_state is None or parts_poses is None:
+            continue
+
+        ee_pos = _to_numpy(robot_state.get("ee_pos"))
+        gripper_width = float(np.asarray(robot_state.get("gripper_width")))
+
+        parts_array = _to_numpy(parts_poses).reshape(num_parts, 7)
+
+        ee_speed = 0.0 if prev_ee_pos is None else float(np.linalg.norm(ee_pos - prev_ee_pos))
+
+        for part_idx in range(num_parts):
+            part_pose_vec = parts_array[part_idx]
+            part_pose_mat_april = T.pose2mat(part_pose_vec)
+            part_pose_mat_robot = robot_from_april @ part_pose_mat_april
+            part_pos_robot = part_pose_mat_robot[:3, 3]
+
+            part_speed = 0.0
+            if prev_part_positions[part_idx] is not None:
+                part_speed = float(np.linalg.norm(part_pos_robot - prev_part_positions[part_idx]))
+
+            distance = float(np.linalg.norm(part_pos_robot - ee_pos))
+
+            gripper_closed = gripper_width < thresholds["gripper"]
+            close_enough = distance < thresholds["distance"]
+            velocity_similar = (
+                abs(part_speed - ee_speed) < thresholds["velocity_diff"]
+                or part_speed > thresholds["min_part_speed"]
+            )
+
+            if gripper_closed and close_enough and velocity_similar:
+                consecutive_counters[part_idx] += 1
+            else:
+                consecutive_counters[part_idx] = 0
+
+            if consecutive_counters[part_idx] >= thresholds["min_steps"]:
+                if part_names[part_idx] not in labels[step_idx]:
+                    labels[step_idx].append(part_names[part_idx])
+
+            prev_part_positions[part_idx] = part_pos_robot
+
+        prev_ee_pos = ee_pos
+
+    return labels
+
+
+def _prepare_rgb_frames(obs: Dict) -> List[np.ndarray]:
+    frames: List[np.ndarray] = []
+    for key in [
+        "color_image1",
+        "color_image2",
+        "color_image3",
+        "image1",
+        "image2",
+        "image3",
+    ]:
+        if key not in obs:
+            continue
+        img = np.asarray(obs[key])
+        if img.ndim != 3:
+            continue
+        if img.shape[0] in (3, 4) and img.shape[-1] not in (3, 4):
+            img = np.moveaxis(img, 0, -1)
+        if img.shape[-1] not in (3, 4):
+            continue
+        if img.dtype != np.uint8:
+            img = img.astype(np.float32)
+            if img.max() <= 1.0:
+                img *= 255.0
+            img = np.clip(img, 0.0, 255.0).astype(np.uint8)
+        frames.append(img)
+    return frames
+
+
+def _render_demonstration_video(
+    observations: List[Dict],
+    grasp_labels: List[List[str]],
+    window_title: str,
+    play_speed_hz: float = 30.0,
+):
+    import cv2  # type: ignore[import]
+
+    wait_ms = max(1, int(1000.0 / max(play_speed_hz, 1e-3)))
+
+    for step_idx, obs in enumerate(observations):
+        frames = _prepare_rgb_frames(obs)
+        if not frames:
+            continue
+
+        bgr_frames = [cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) for frame in frames]
+        frame_bgr = np.hstack(bgr_frames)
+
+        label_parts = grasp_labels[step_idx]
+        label_text = ", ".join(label_parts) if label_parts else "none"
+        display = np.ascontiguousarray(frame_bgr)
+        cv2.putText(
+            display,
+            f"grasp: {label_text}",
+            org=(10, 30),
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=0.5,
+            color=(255, 255, 0),
+            thickness=2,
+        )
+        cv2.putText(
+            display,
+            f"frame: {step_idx}",
+            org=(10, 60),
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=0.5,
+            color=(0, 255, 255),
+            thickness=2,
+        )
+
+        cv2.imshow(window_title, display)
+        key = cv2.waitKey(wait_ms)
+        if key in (27, ord("q")):
+            break
+
+    cv2.destroyWindow(window_title)
+
+
 def main():
     args = parse_args()
     dataset_root = Path(args.dataset).expanduser().resolve()
@@ -479,6 +617,21 @@ def main():
         robot_from_april = np.linalg.inv(config["robot"]["tag_base_from_robot_base"])
 
         observations = data.get("observations", [])
+
+        if args.render_video and observations:
+            grasp_labels = _detect_grasp_labels(
+                observations,
+                part_names,
+                thresholds,
+                robot_from_april,
+            )
+            window_title = f"{furniture_name} - {annotation_path.stem}" if hasattr(annotation_path, "stem") else str(annotation_path)
+            _render_demonstration_video(
+                observations,
+                grasp_labels,
+                window_title=window_title,
+            )
+
         _analyze_observations(
             furniture_name,
             observations,

@@ -4,15 +4,20 @@
 pip install --upgrade pip wheel
 pip install setuptools==58
 pip install --upgrade pip==22.2.2
+```
 
+# Third Party Packages
+
+## Curobo
+```bash
 # curobo installation
 git submodule update --init --recursive # pull curobo in 3dparty
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118 # install torch to match cuda toolkit
 cd 3dparty/curobo && pip install -e . --no-build-isolation
 ```
 
-# Third Party Packages
 ## FoundationPose
+We do not use this at this moment
 ```bash
 # Install Eigen3 3.4.0 under conda environment
 conda install conda-forge::eigen=3.4.0
