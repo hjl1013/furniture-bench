@@ -12,7 +12,8 @@ Example:
     ./generate_panda_gripper_mesh.py \
         --output panda_gripper_collision.stl \
         --finger-offset 0.01 \
-        --hand-mesh ../meshes/collision/hand.stl
+        --hand-mesh ../meshes/collision/hand.stl \
+        --origin-translation 0.01 0.02 -0.005
 """
 
 from __future__ import annotations
@@ -93,17 +94,23 @@ def _load_hand_mesh(path: pathlib.Path) -> trimesh.Trimesh:
     return hand_mesh
 
 
-def build_gripper_mesh(joint_offset: float = 0.04, hand_mesh_path: Optional[pathlib.Path] = None) -> trimesh.Trimesh:
+def build_gripper_mesh(
+    joint_offset: float = 0.04,
+    hand_mesh_path: Optional[pathlib.Path] = None,
+    origin_translation: Optional[Iterable[float]] = None,
+) -> trimesh.Trimesh:
     """Create a combined mesh for the Panda gripper.
 
     Args:
         joint_offset: Translation of each finger along its prismatic joint axis.
             Must be between 0 and 0.04 metres for the stock Panda gripper.
         hand_mesh_path: Optional path to an existing base hand mesh to merge.
+        origin_translation: Optional translation vector [x, y, z] to shift the mesh origin.
+            Defaults to None (no translation).
 
     Returns:
         A `trimesh.Trimesh` describing the gripper geometry in the `panda_hand`
-        link frame.
+        link frame (with optional origin translation applied).
     """
 
     if joint_offset < 0.0:
@@ -117,7 +124,16 @@ def build_gripper_mesh(joint_offset: float = 0.04, hand_mesh_path: Optional[path
     if hand_mesh_path is not None:
         meshes.append(_load_hand_mesh(hand_mesh_path))
 
-    return trimesh.util.concatenate(meshes)
+    gripper_mesh = trimesh.util.concatenate(meshes)
+
+    # Apply origin translation if provided
+    if origin_translation is not None:
+        translation = np.asarray(origin_translation, dtype=float)
+        if translation.shape != (3,):
+            raise ValueError(f"Origin translation must be a 3D vector [x, y, z], got shape {translation.shape}")
+        gripper_mesh.apply_translation(translation)
+
+    return gripper_mesh
 
 
 def parse_args() -> argparse.Namespace:
@@ -139,6 +155,14 @@ def parse_args() -> argparse.Namespace:
         type=pathlib.Path,
         help="Optional path to an existing Panda hand mesh to merge with the generated fingers.",
     )
+    parser.add_argument(
+        "--origin-translation",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        help="Translation vector [x, y, z] in metres to shift the mesh origin. "
+             "Example: --origin-translation 0.01 0.02 -0.005",
+    )
     return parser.parse_args()
 
 
@@ -155,10 +179,17 @@ def main() -> None:
     if hand_mesh_path is not None:
         hand_mesh_path = hand_mesh_path.expanduser().resolve()
 
-    gripper_mesh = build_gripper_mesh(args.finger_offset, hand_mesh_path)
+    gripper_mesh = build_gripper_mesh(
+        args.finger_offset,
+        hand_mesh_path,
+        origin_translation=args.origin_translation,
+    )
     gripper_mesh.export(output_path)
 
-    print(f"Exported Panda gripper mesh to {output_path}")
+    origin_info = ""
+    if args.origin_translation is not None:
+        origin_info = f" (origin translated by {args.origin_translation})"
+    print(f"Exported Panda gripper mesh to {output_path}{origin_info}")
 
 
 if __name__ == "__main__":

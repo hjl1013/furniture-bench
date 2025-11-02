@@ -30,7 +30,7 @@ config: Dict[str, Any] = {
         ],
         "base_tag_xyz": (0.23 + 0.0715, 0, -ROBOT_HEIGHT),
         "tag_base_from_robot_base": get_mat(
-            (0.23 + 0.0715, 0, -ROBOT_HEIGHT), (np.pi, 0, np.pi / 2)
+            (0, -(0.23 + 0.0715), -ROBOT_HEIGHT), (np.pi, 0, np.pi / 2)
         ),  # Relative pose of the base tag from the robot base. This can be used to convert the pose in the base tag's coordinate to the robot's coordinate.
         "max_gripper_width": {
             "square_table": 0.065,
