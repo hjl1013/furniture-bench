@@ -502,12 +502,13 @@ class FurnitureSimEnv(gym.Env):
 
     def set_camera(self):
         self.camera_handles = {}
-        self.camera_obs = {}
+        # Store mapping from obs_key to list of (camera_handle, env_idx, render_type) tuples
+        self.camera_obs_config = {}
 
         def create_camera(name, i):
             env = self.envs[i]
             camera_cfg = gymapi.CameraProperties()
-            camera_cfg.enable_tensors = True
+            camera_cfg.enable_tensors = False
             camera_cfg.width = self.img_size[0]
             camera_cfg.height = self.img_size[1]
             camera_cfg.near_plane = 0.001
@@ -565,14 +566,10 @@ class FurnitureSimEnv(gym.Env):
                 if len(self.camera_handles[camera_name]) <= env_idx:
                     self.camera_handles[camera_name].append(create_camera(camera_name, env_idx))
                 handle = self.camera_handles[camera_name][env_idx]
-                tensor = gymtorch.wrap_tensor(
-                    self.isaac_gym.get_camera_image_gpu_tensor(
-                        self.sim, env, handle, render_type
-                    )
-                )
-                if k not in self.camera_obs:
-                    self.camera_obs[k] = []
-                self.camera_obs[k].append(tensor)
+                # Store configuration for fetching images later
+                if k not in self.camera_obs_config:
+                    self.camera_obs_config[k] = []
+                self.camera_obs_config[k].append((handle, env_idx, render_type))
 
     def import_assets(self):
         self.base_tag_asset = self._import_base_tag_asset()
@@ -814,7 +811,12 @@ class FurnitureSimEnv(gym.Env):
                 self.isaac_gym.draw_viewer(self.viewer, self.sim, False)
                 self.isaac_gym.sync_frame_time(self.sim)
 
-        self.isaac_gym.end_access_image_tensors(self.sim)
+
+
+        # Fetch results, step graphics, and render cameras before getting observation
+        self.isaac_gym.fetch_results(self.sim, True)
+        self.isaac_gym.step_graphics(self.sim)
+        self.isaac_gym.render_all_camera_sensors(self.sim)
 
         obs = self._get_observation()
         self.env_steps += 1
@@ -962,8 +964,7 @@ class FurnitureSimEnv(gym.Env):
         self.isaac_gym.refresh_rigid_body_state_tensor(self.sim)
         self.isaac_gym.refresh_jacobian_tensors(self.sim)
         self.isaac_gym.refresh_mass_matrix_tensors(self.sim)
-        self.isaac_gym.render_all_camera_sensors(self.sim)
-        self.isaac_gym.start_access_image_tensors(self.sim)
+
 
     def init_ctrl(self):
         # Positional and velocity gains for robot control.
@@ -1077,15 +1078,37 @@ class FurnitureSimEnv(gym.Env):
         return P, V
 
     def _get_observation(self):
+        # Ensure cameras are rendered before fetching images
+        self.isaac_gym.fetch_results(self.sim, True)
+        self.isaac_gym.step_graphics(self.sim)
+        self.isaac_gym.render_all_camera_sensors(self.sim)
         robot_state = self._read_robot_state()
-        color_obs = {
-            k: self._get_color_obs(v)
-            for k, v in self.camera_obs.items()
-            if "color" in k
-        }
-        depth_obs = {
-            k: torch.stack(v) for k, v in self.camera_obs.items() if "depth" in k
-        }
+        # Fetch camera images for each observation key
+        color_obs = {}
+        depth_obs = {}
+        for k, configs in self.camera_obs_config.items():
+            images = []
+            for handle, env_idx, render_type in configs:
+                env = self.envs[env_idx]
+                image = self.isaac_gym.get_camera_image(
+                    self.sim, env, handle, render_type
+                )
+                
+                # Reshape the flat array returned by get_camera_image()
+                if render_type == gymapi.IMAGE_COLOR:
+                    # Color images are RGBA: (height, width, 4)
+                    image = np.reshape(image, (self.img_size[1], self.img_size[0], 4))
+                elif render_type == gymapi.IMAGE_DEPTH:
+                    # Depth images: (height, width)
+                    image = np.reshape(image, (self.img_size[1], self.img_size[0]))
+                
+                tensor = torch.from_numpy(image).to(device=self.device)
+                images.append(tensor)
+            
+            if "color" in k:
+                color_obs[k] = self._get_color_obs(images)
+            elif "depth" in k:
+                depth_obs[k] = torch.stack(images)
 
         if self.np_step_out:
             robot_state = {k: v.cpu().numpy() for k, v in robot_state.items()}
