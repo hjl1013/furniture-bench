@@ -1077,9 +1077,6 @@ def main():
         furniture = furniture_factory(furniture_name)
         part_names = [part.name for part in furniture.parts]
         thresholds = _prepare_thresholds(furniture_name, args)
-        # Environment defines: april_to_robot_mat = base_tag_from_robot_mat (line 643-644)
-        # This transforms FROM april TO robot: april_to_robot_mat @ pose_april = pose_robot
-        # So robot_from_april should be base_tag_from_robot_mat directly
         robot_from_april = config["robot"]["tag_base_from_robot_base"]
 
         observations = data.get("observations", [])
