@@ -75,41 +75,98 @@ def print_mesh_info(mesh, title="Mesh"):
                 print(f"  ⚠️  WARNING: Very high aspect ratio - mesh might be flat")
 
 
-def visualize_mesh(mesh, title="Mesh Visualization", color=None):
-    """Visualize a trimesh using open3d."""
-    o3d = _ensure_open3d()
-    
-    # Convert to open3d
-    o3d_mesh = _trimesh_to_open3d(mesh)
-    
-    # Set color
+def visualize_mesh(mesh, title="Mesh Visualization", color=None, use_viser=False):
+    """Visualize a trimesh using open3d or viser."""
     if color is None:
         color = np.array([0.7, 0.7, 0.9])  # Light blue
-    o3d_mesh.paint_uniform_color(color)
+    color_tuple = tuple(color[:3])
     
-    # Create coordinate frame at origin
-    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
-    
-    # Create bounding box wireframe
-    bbox = o3d.geometry.LineSet.create_from_axis_aligned_bounding_box(
-        o3d_mesh.get_axis_aligned_bounding_box()
-    )
-    bbox.paint_uniform_color([1.0, 0.0, 0.0])  # Red
-    
-    # Visualize
-    geometries = [o3d_mesh, coord_frame, bbox]
-    
-    print(f"\nVisualizing {title}...")
-    print("Controls:")
-    print("  - Mouse: Rotate (left drag), Pan (right drag), Zoom (scroll)")
-    print("  - Press 'Q' or close window to exit")
-    
-    o3d.visualization.draw_geometries(
-        geometries,
-        window_name=title,
-        width=1280,
-        height=720,
-    )
+    if use_viser:
+        from reset.visualization.viser_utils import (
+            create_viser_server,
+            add_mesh_to_viser_scene,
+            add_frame_to_viser_scene,
+            _trimesh_to_viser_mesh_data,
+            VISER_AVAILABLE,
+        )
+        if not VISER_AVAILABLE:
+            raise ImportError("viser is required for viser visualization. Install with: pip install viser")
+        
+        import furniture_bench.utils.transform as T
+        
+        server = create_viser_server(title=title)
+        
+        # Add mesh
+        mesh_data = _trimesh_to_viser_mesh_data(mesh, color=color_tuple)
+        add_mesh_to_viser_scene(server, "/mesh", mesh_data)
+        
+        # Add coordinate frame at origin
+        identity_transform = np.eye(4)
+        add_frame_to_viser_scene(server, "/frame", identity_transform, size=0.1)
+        
+        # Add bounding box as lines
+        bounds = mesh.bounds
+        if len(bounds) == 2:
+            bbox_corners = np.array([
+                [bounds[0][0], bounds[0][1], bounds[0][2]],
+                [bounds[1][0], bounds[0][1], bounds[0][2]],
+                [bounds[1][0], bounds[1][1], bounds[0][2]],
+                [bounds[0][0], bounds[1][1], bounds[0][2]],
+                [bounds[0][0], bounds[0][1], bounds[1][2]],
+                [bounds[1][0], bounds[0][1], bounds[1][2]],
+                [bounds[1][0], bounds[1][1], bounds[1][2]],
+                [bounds[0][0], bounds[1][1], bounds[1][2]],
+            ])
+            bbox_lines = np.array([
+                [0, 1], [1, 2], [2, 3], [3, 0],  # bottom face
+                [4, 5], [5, 6], [6, 7], [7, 4],  # top face
+                [0, 4], [1, 5], [2, 6], [3, 7],  # vertical edges
+            ])
+            from reset.visualization.viser_utils import add_line_set_to_viser_scene
+            add_line_set_to_viser_scene(server, "/bbox", bbox_corners, bbox_lines, color=(1.0, 0.0, 0.0))
+        
+        print(f"\nVisualizing {title} with viser...")
+        print("Open your browser to the URL shown above to view the visualization.")
+        print("Press Ctrl+C to exit.")
+        
+        try:
+            import time
+            while True:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\nExiting...")
+    else:
+        o3d = _ensure_open3d()
+        
+        # Convert to open3d
+        o3d_mesh = _trimesh_to_open3d(mesh)
+        
+        # Set color
+        o3d_mesh.paint_uniform_color(color)
+        
+        # Create coordinate frame at origin
+        coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+        
+        # Create bounding box wireframe
+        bbox = o3d.geometry.LineSet.create_from_axis_aligned_bounding_box(
+            o3d_mesh.get_axis_aligned_bounding_box()
+        )
+        bbox.paint_uniform_color([1.0, 0.0, 0.0])  # Red
+        
+        # Visualize
+        geometries = [o3d_mesh, coord_frame, bbox]
+        
+        print(f"\nVisualizing {title}...")
+        print("Controls:")
+        print("  - Mouse: Rotate (left drag), Pan (right drag), Zoom (scroll)")
+        print("  - Press 'Q' or close window to exit")
+        
+        o3d.visualization.draw_geometries(
+            geometries,
+            window_name=title,
+            width=1280,
+            height=720,
+        )
 
 
 def main():
@@ -130,6 +187,11 @@ def main():
         "--no-visualize",
         action="store_true",
         help="Don't open visualization window, just print info"
+    )
+    parser.add_argument(
+        "--use-viser",
+        action="store_true",
+        help="Use viser for visualization instead of Open3D"
     )
     args = parser.parse_args()
     
@@ -258,7 +320,7 @@ def main():
         print("Visualization")
         print(f"{'='*60}")
         try:
-            visualize_mesh(processed_mesh, title=f"{args.furniture} - {args.part}")
+            visualize_mesh(processed_mesh, title=f"{args.furniture} - {args.part}", use_viser=args.use_viser)
         except Exception as e:
             print(f"ERROR during visualization: {e}")
             import traceback

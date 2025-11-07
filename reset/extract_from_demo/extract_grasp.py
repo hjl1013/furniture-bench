@@ -1,4 +1,5 @@
 import argparse
+import colorsys
 import copy
 import json
 import pickle
@@ -208,6 +209,190 @@ def _analyze_observations(
                 part_store["part_quat"].append(part_pose_vec[3:])
 
 
+def _quaternion_distance(q1: np.ndarray, q2: np.ndarray) -> float:
+    """
+    Compute angular distance between two quaternions (handles double-cover).
+    
+    Args:
+        q1, q2: Quaternions in xyzw format
+    
+    Returns:
+        Angular distance in radians (0 to pi)
+    """
+    # Normalize quaternions
+    q1_norm = q1 / (np.linalg.norm(q1) + 1e-10)
+    q2_norm = q2 / (np.linalg.norm(q2) + 1e-10)
+    
+    # Convert to wxyz for quaternion math
+    q1_wxyz = T.convert_quat(q1_norm, "wxyz")
+    q2_wxyz = T.convert_quat(q2_norm, "wxyz")
+    
+    # Compute dot product (handles double-cover by taking absolute value)
+    dot = np.abs(np.dot(q1_wxyz, q2_wxyz))
+    dot = np.clip(dot, -1.0, 1.0)
+    
+    # Angular distance
+    return 2 * np.arccos(dot)
+
+
+def _pose_distance(pos1: np.ndarray, quat1: np.ndarray, pos2: np.ndarray, quat2: np.ndarray, pos_weight: float = 1.0, quat_weight: float = 1.0) -> float:
+    """
+    Compute distance between two poses (position + quaternion).
+    
+    Args:
+        pos1, pos2: Positions (3D)
+        quat1, quat2: Quaternions (xyzw)
+        pos_weight: Weight for position component
+        quat_weight: Weight for quaternion component
+    
+    Returns:
+        Combined distance metric
+    """
+    pos_dist = np.linalg.norm(pos1 - pos2)
+    quat_dist = _quaternion_distance(quat1, quat2)
+    
+    return pos_weight * pos_dist + quat_weight * quat_dist
+
+
+def _cluster_grasp_poses(rel_pos: np.ndarray, rel_quat: np.ndarray, min_samples: int = 3, eps_pos: float = 0.02, eps_quat: float = 0.3):
+    """
+    Cluster grasp poses using DBSCAN with custom distance metric.
+    
+    Uses a combined distance metric that accounts for both position and quaternion differences.
+    The distance is: sqrt((pos_dist/eps_pos)^2 + (quat_dist/eps_quat)^2)
+    
+    Args:
+        rel_pos: (N, 3) array of relative positions
+        rel_quat: (N, 4) array of relative quaternions (xyzw)
+        min_samples: Minimum samples per cluster for DBSCAN
+        eps_pos: Epsilon threshold for position (meters) - poses within this distance are considered similar
+        eps_quat: Epsilon threshold for quaternion (radians) - poses within this angular distance are considered similar
+    
+    Returns:
+        labels: Cluster labels (-1 for noise)
+        n_clusters: Number of clusters found
+    """
+    try:
+        from sklearn.cluster import DBSCAN
+    except ImportError:
+        raise ImportError("scikit-learn is required for clustering. Install with: pip install scikit-learn")
+    
+    n_samples = len(rel_pos)
+    if n_samples < min_samples:
+        # Too few samples, return single cluster
+        return np.zeros(n_samples, dtype=int), 1
+    
+    # Compute pairwise distance matrix using custom metric
+    # Distance combines normalized position and quaternion distances
+    def pose_distance_func(i, j):
+        """Custom distance function for two pose indices."""
+        pos_dist = np.linalg.norm(rel_pos[i] - rel_pos[j])
+        quat_dist = _quaternion_distance(rel_quat[i], rel_quat[j])
+        
+        # Normalize by epsilon thresholds
+        pos_norm = pos_dist / (eps_pos + 1e-10)
+        quat_norm = quat_dist / (eps_quat + 1e-10)
+        
+        # Combined distance (Euclidean in normalized space)
+        return np.sqrt(pos_norm**2 + quat_norm**2)
+    
+    # Build distance matrix
+    # For efficiency with large datasets, we could use a sparse representation,
+    # but for typical grasp datasets (< 1000 samples), full matrix is fine
+    distance_matrix = np.zeros((n_samples, n_samples))
+    for i in range(n_samples):
+        for j in range(i + 1, n_samples):
+            dist = pose_distance_func(i, j)
+            distance_matrix[i, j] = dist
+            distance_matrix[j, i] = dist
+    
+    # Use DBSCAN with precomputed distance matrix
+    # eps=1.0 means poses are in same cluster if combined normalized distance <= 1.0
+    clusterer = DBSCAN(eps=1.0, min_samples=min_samples, metric='precomputed')
+    labels = clusterer.fit_predict(distance_matrix)
+    
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    
+    return labels, n_clusters
+
+
+def _find_representative_grasps_for_all_clusters(rel_pos: np.ndarray, rel_quat: np.ndarray, ee_pos: np.ndarray, ee_quat: np.ndarray):
+    """
+    Find representative grasp poses for all clusters by clustering and selecting representative from each cluster.
+    
+    Args:
+        rel_pos: (N, 3) relative positions
+        rel_quat: (N, 4) relative quaternions (xyzw)
+        ee_pos: (N, 3) end-effector positions
+        ee_quat: (N, 4) end-effector quaternions
+    
+    Returns:
+        cluster_grasps: List of dictionaries, each containing:
+            - cluster_id: Cluster label (int, -1 for noise)
+            - cluster_size: Number of samples in cluster
+            - relative_position: Representative relative position
+            - relative_quaternion: Representative relative quaternion
+            - ee_position: Corresponding end-effector position
+            - ee_quaternion: Corresponding end-effector quaternion
+        n_clusters: Total number of clusters found (excluding noise)
+    """
+    n_samples = len(rel_pos)
+    
+    if n_samples == 0:
+        raise ValueError("No samples provided")
+    
+    if n_samples == 1:
+        # Single sample, return it as a single cluster
+        return [{
+            "cluster_id": 0,
+            "cluster_size": 1,
+            "relative_position": rel_pos[0],
+            "relative_quaternion": rel_quat[0],
+            "ee_position": ee_pos[0],
+            "ee_quaternion": ee_quat[0],
+        }], 1
+    
+    # Cluster the poses
+    labels, n_clusters = _cluster_grasp_poses(rel_pos, rel_quat)
+    
+    cluster_grasps = []
+    
+    # Process each cluster (including noise cluster if present)
+    unique_labels = np.unique(labels)
+    
+    for cluster_label in unique_labels:
+        cluster_mask = labels == cluster_label
+        cluster_size = np.sum(cluster_mask)
+        
+        if cluster_size == 0:
+            continue
+        
+        # Get samples in this cluster
+        cluster_rel_pos = rel_pos[cluster_mask]
+        cluster_rel_quat = rel_quat[cluster_mask]
+        cluster_ee_pos = ee_pos[cluster_mask]
+        cluster_ee_quat = ee_quat[cluster_mask]
+        
+        # Select representative pose: use the pose closest to cluster centroid
+        cluster_pos_centroid = cluster_rel_pos.mean(axis=0)
+        pos_dists_to_centroid = np.linalg.norm(cluster_rel_pos - cluster_pos_centroid, axis=1)
+        closest_idx_in_cluster = np.argmin(pos_dists_to_centroid)
+        
+        cluster_grasps.append({
+            "cluster_id": int(cluster_label),
+            "cluster_size": int(cluster_size),
+            "relative_position": cluster_rel_pos[closest_idx_in_cluster].copy(),
+            "relative_quaternion": cluster_rel_quat[closest_idx_in_cluster].copy(),
+            "ee_position": cluster_ee_pos[closest_idx_in_cluster].copy(),
+            "ee_quaternion": cluster_ee_quat[closest_idx_in_cluster].copy(),
+        })
+    
+    # Sort by cluster size (largest first), but keep noise cluster (-1) at the end
+    cluster_grasps.sort(key=lambda x: (x["cluster_id"] == -1, -x["cluster_size"]))
+    
+    return cluster_grasps, n_clusters
+
+
 def _summarize(aggregate_store: Dict[str, Dict[str, Dict[str, List[np.ndarray]]]]):
     summary = {}
     for furniture_name, parts_data in aggregate_store.items():
@@ -225,44 +410,99 @@ def _summarize(aggregate_store: Dict[str, Dict[str, Dict[str, List[np.ndarray]]]
             part_pos = np.vstack(samples["part_pos"])
             part_quat = np.vstack(samples["part_quat"])
 
+            # Find representative grasp poses for all clusters
+            try:
+                cluster_grasps, n_clusters = _find_representative_grasps_for_all_clusters(
+                    rel_pos, rel_quat, ee_pos, ee_quat
+                )
+            except Exception as e:
+                print(f"Warning: Clustering failed for {part_name}: {e}. Using first sample.")
+                cluster_grasps = [{
+                    "cluster_id": 0,
+                    "cluster_size": len(rel_pos),
+                    "relative_position": rel_pos[0],
+                    "relative_quaternion": rel_quat[0],
+                    "ee_position": ee_pos[0],
+                    "ee_quaternion": ee_quat[0],
+                }]
+                n_clusters = 1
+
+            # Compute statistics for the entire dataset (for reference)
             rel_pos_mean = rel_pos.mean(axis=0)
             rel_pos_std = rel_pos.std(axis=0)
             rel_distance_mean = float(np.linalg.norm(rel_pos, axis=1).mean())
             rel_distance_std = float(np.linalg.norm(rel_pos, axis=1).std())
-
-            mean_rel_quat = _avg_quaternion(rel_quat)
 
             pos_corr = _corr_block(ee_pos, part_pos)
             quat_corr = _corr_block(ee_quat, part_quat)
 
             part_pos_mean = part_pos.mean(axis=0)
             part_pos_std = part_pos.std(axis=0)
-            mean_part_quat = _avg_quaternion(part_quat)
+
+            # Find dominant cluster (largest cluster, excluding noise)
+            valid_clusters = [cg for cg in cluster_grasps if cg["cluster_id"] >= 0]
+            if valid_clusters:
+                dominant_cluster = max(valid_clusters, key=lambda x: x["cluster_size"])
+                dominant_cluster_size = dominant_cluster["cluster_size"]
+                dominant_rel_pos = dominant_cluster["relative_position"]
+                dominant_rel_quat = dominant_cluster["relative_quaternion"]
+                dominant_ee_pos = dominant_cluster["ee_position"]
+                dominant_ee_quat = dominant_cluster["ee_quaternion"]
+            else:
+                # All noise, use first cluster
+                dominant_cluster = cluster_grasps[0] if cluster_grasps else None
+                dominant_cluster_size = cluster_grasps[0]["cluster_size"] if cluster_grasps else 0
+                dominant_rel_pos = cluster_grasps[0]["relative_position"] if cluster_grasps else rel_pos[0]
+                dominant_rel_quat = cluster_grasps[0]["relative_quaternion"] if cluster_grasps else rel_quat[0]
+                dominant_ee_pos = cluster_grasps[0]["ee_position"] if cluster_grasps else ee_pos[0]
+                dominant_ee_quat = cluster_grasps[0]["ee_quaternion"] if cluster_grasps else ee_quat[0]
 
             print(
-                f"- {part_name}: samples={len(rel_pos)}\n"
+                f"- {part_name}: samples={len(rel_pos)}, clusters={n_clusters}\n"
+                f"  dominant cluster (size={dominant_cluster_size}):\n"
+                f"    rel pos (m): {dominant_rel_pos.round(4)}\n"
+                f"    rel quat (xyzw): {np.round(dominant_rel_quat, 4)}\n"
+                f"  all clusters: {len(cluster_grasps)} representative grasp(s)\n"
                 f"  mean rel pos (m): {rel_pos_mean.round(4)}\n"
                 f"  std rel pos (m): {rel_pos_std.round(4)}\n"
                 f"  mean rel dist (m): {rel_distance_mean:.4f} (std {rel_distance_std:.4f})\n"
-                f"  mean rel quat (xyzw): {np.round(mean_rel_quat, 4)}\n"
                 f"  mean part pos (m): {part_pos_mean.round(4)}\n"
                 f"  std part pos (m): {part_pos_std.round(4)}\n"
                 f"  pos corr (ee vs part):\n{np.round(pos_corr, 3)}\n"
                 f"  quat corr (ee vs part):\n{np.round(quat_corr, 3)}"
             )
 
+            # Convert cluster grasps to JSON-serializable format
+            cluster_grasps_serializable = []
+            for cg in cluster_grasps:
+                cluster_grasps_serializable.append({
+                    "cluster_id": cg["cluster_id"],
+                    "cluster_size": cg["cluster_size"],
+                    "relative_position": cg["relative_position"].tolist(),
+                    "relative_quaternion": cg["relative_quaternion"].tolist(),
+                    "ee_position": cg["ee_position"].tolist(),
+                    "ee_quaternion": cg["ee_quaternion"].tolist(),
+                })
+
             summary[furniture_name][part_name] = {
                 "samples": int(len(rel_pos)),
+                "n_clusters": int(n_clusters),
+                "cluster_grasps": cluster_grasps_serializable,
+                # Keep dominant cluster info for backward compatibility
+                "dominant_cluster_size": int(dominant_cluster_size),
+                "dominant_relative_position": dominant_rel_pos.tolist(),
+                "dominant_relative_quaternion": dominant_rel_quat.tolist(),
+                "dominant_ee_position": dominant_ee_pos.tolist(),
+                "dominant_ee_quaternion": dominant_ee_quat.tolist(),
+                # Keep statistics for reference
                 "mean_relative_position": rel_pos_mean.tolist(),
                 "std_relative_position": rel_pos_std.tolist(),
                 "mean_relative_distance": rel_distance_mean,
                 "std_relative_distance": rel_distance_std,
-                "mean_relative_quaternion": mean_rel_quat.tolist(),
                 "position_correlation": np.nan_to_num(pos_corr).tolist(),
                 "quaternion_correlation": np.nan_to_num(quat_corr).tolist(),
                 "mean_part_position": part_pos_mean.tolist(),
                 "std_part_position": part_pos_std.tolist(),
-                "mean_part_quaternion": mean_part_quat.tolist(),
             }
 
     return summary
@@ -270,13 +510,14 @@ def _summarize(aggregate_store: Dict[str, Dict[str, Dict[str, List[np.ndarray]]]
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Extract grasp pose statistics from demonstrations using mesh-based contact detection")
-    parser.add_argument("--dataset", required=True, help="Path to a dataset directory or a single pickle file")
+    parser.add_argument("--dataset", default=None, help="Path to a dataset directory or a single pickle file (required if --grasps is not specified)")
+    parser.add_argument("--grasps", type=Path, default=None, help="Path to saved grasps file (.pkl or .json). If specified, loads from this file instead of extracting from dataset")
     parser.add_argument("--furniture", default=None, help="Override furniture name (otherwise taken from dataset)")
     parser.add_argument("--contact-tolerance", type=float, default=0.015, help="Distance threshold (m) for mesh-based contact detection. Default: 0.015 (15mm)")
     parser.add_argument("--gripper-close-threshold", type=float, default=None, help="Absolute threshold (m) for gripper width when considered closed")
     parser.add_argument("--gripper-close-ratio", type=float, default=0.9, help="Ratio of max gripper width used when threshold is not provided")
     parser.add_argument("--min-consecutive-steps", type=int, default=1, help="Number of consecutive frames with contact before logging a grasp")
-    parser.add_argument("--output", type=Path, default=None, help="Directory path to save summary.json and aggregate_store.json files")
+    parser.add_argument("--output", type=Path, default=None, help="Directory path to save summary.pkl and grasps.pkl files")
     parser.add_argument("--render", action="store_true", help="Render sampled grasp poses based on computed statistics")
     parser.add_argument("--render-video", action="store_true", help="Render video of the demonstrations")
     parser.add_argument("--render-part", default=None, help="Name of a specific part to render (defaults to all)")
@@ -780,6 +1021,7 @@ def _render_from_summary(
     part_filter: Optional[str],
     samples: int,
     spread_mult: float,
+    use_viser: bool = False,
 ):
     if furniture_filter is not None and furniture_filter not in summary:
         raise ValueError(f"Requested furniture '{furniture_filter}' not found in summary")
@@ -800,81 +1042,259 @@ def _render_from_summary(
             else sorted(parts_stats.keys())
         )
 
-        o3d = _ensure_open3d()
-        geometries = []
+        furniture_conf = config["furniture"].get(furniture_name, {})
         display_idx = 0
 
-        gripper_mesh = None
-        try:
-            gripper_mesh = _load_gripper_mesh()
-        except Exception as exc:
-            print(f"Warning: unable to load gripper mesh: {exc}")
-
-        furniture_conf = config["furniture"].get(furniture_name, {})
-
-        for part_name in parts:
-            if part_name not in parts_stats:
-                print(f"Part '{part_name}' not in summary for {furniture_name}, skipping")
-                continue
-
-            stats = parts_stats[part_name]
-            mean_rel_pos = np.array(stats["mean_relative_position"], dtype=np.float64)
-            mean_rel_quat = _quat_normalize(np.array(stats["mean_relative_quaternion"], dtype=np.float64))
-
-            rel_T = _pose_vec_to_mat(mean_rel_pos, mean_rel_quat)
-            rel_T_inv = np.linalg.inv(rel_T)
-
-            part_conf = furniture_conf.get(part_name)
-            if not isinstance(part_conf, dict) or "asset_file" not in part_conf:
-                print(f"Part config missing asset file for '{part_name}', skipping mesh rendering")
-                continue
-
-            try:
-                part_mesh = _load_part_mesh(part_conf["asset_file"])
-            except Exception as exc:
-                print(f"Warning: unable to load mesh for part '{part_name}': {exc}")
-                part_mesh = None
-
-            # Use the original/oriented part pose (identity transform)
-            part_T = np.eye(4)
-            offset = np.array([0.5 * display_idx, 0.0, 0.0])
-            part_T_display = part_T.copy()
-            part_T_display[:3, 3] = offset
-
-            ee_T_display = part_T_display @ rel_T_inv
-
-            if part_mesh is not None:
-                geometries.append(
-                    _mesh_with_transform(
-                        part_mesh,
-                        part_T_display,
-                        color=(0.9, 0.7, 0.3),
-                    )
-                )
-
-            if gripper_mesh is not None:
-                geometries.append(
-                    _mesh_with_transform(
-                        gripper_mesh,
-                        ee_T_display,
-                        color=(0.5, 0.7, 0.9),
-                    )
-                )
-
-            geometries.append(
-                o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05).translate(offset)
+        if use_viser:
+            from reset.visualization.viser_utils import (
+                create_viser_server,
+                add_mesh_to_viser_scene,
+                add_frame_to_viser_scene,
+                _open3d_to_viser_mesh_data,
+                VISER_AVAILABLE,
             )
+            if not VISER_AVAILABLE:
+                raise ImportError("viser is required for viser visualization. Install with: pip install viser")
+            
+            server = create_viser_server(title=f"All cluster grasps for {furniture_name}")
+            
+            gripper_mesh_o3d = None
+            try:
+                gripper_mesh_o3d = _load_gripper_mesh()
+            except Exception as exc:
+                print(f"Warning: unable to load gripper mesh: {exc}")
+            
+            for part_name in parts:
+                if part_name not in parts_stats:
+                    print(f"Part '{part_name}' not in summary for {furniture_name}, skipping")
+                    continue
 
-            display_idx += 1
+                stats = parts_stats[part_name]
+                
+                # Get cluster grasps
+                cluster_grasps = stats.get("cluster_grasps", [])
+                if not cluster_grasps:
+                    print(f"No cluster grasps found for '{part_name}', skipping")
+                    continue
+                
+                # Filter out noise clusters (cluster_id == -1) for visualization
+                valid_clusters = [cg for cg in cluster_grasps if cg["cluster_id"] >= 0]
+                if not valid_clusters:
+                    # Fall back to all clusters if no valid ones
+                    valid_clusters = cluster_grasps
+                
+                part_conf = furniture_conf.get(part_name)
+                if not isinstance(part_conf, dict) or "asset_file" not in part_conf:
+                    print(f"Part config missing asset file for '{part_name}', skipping mesh rendering")
+                    continue
 
-        if not geometries:
-            print(f"No geometries to render for {furniture_name}")
-            continue
+                try:
+                    part_mesh_o3d = _load_part_mesh(part_conf["asset_file"])
+                except Exception as exc:
+                    print(f"Warning: unable to load mesh for part '{part_name}': {exc}")
+                    part_mesh_o3d = None
 
-        o3d.visualization.draw_geometries(
-            geometries,
-            window_name=f"Sampled grasps for {furniture_name}",
-        )
+                # Visualize each cluster grasp
+                for cluster_idx, cluster_grasp in enumerate(valid_clusters):
+                    rel_pos = np.array(cluster_grasp["relative_position"], dtype=np.float64)
+                    rel_quat = np.array(cluster_grasp["relative_quaternion"], dtype=np.float64)
+                    rel_quat = _quat_normalize(rel_quat)
+                    
+                    cluster_id = cluster_grasp["cluster_id"]
+                    cluster_size = cluster_grasp["cluster_size"]
+
+                    rel_T = _pose_vec_to_mat(rel_pos, rel_quat)
+                    rel_T_inv = np.linalg.inv(rel_T)
+
+                    # Use the original/oriented part pose (identity transform)
+                    # Offset each cluster horizontally, and each part vertically
+                    part_T = np.eye(4)
+                    offset_x = 0.5 * cluster_idx  # Horizontal offset for clusters
+                    offset_y = 0.8 * display_idx  # Vertical offset for parts
+                    offset = np.array([offset_x, offset_y, 0.0])
+                    part_T_display = part_T.copy()
+                    part_T_display[:3, 3] = offset
+
+                    ee_T_display = part_T_display @ rel_T_inv
+
+                    # Color code: part in orange/yellow, gripper color varies by cluster
+                    # Use a color palette that cycles through different hues
+                    hue = (cluster_idx * 0.618) % 1.0  # Golden ratio for better color distribution
+                    gripper_rgb = colorsys.hsv_to_rgb(hue, 0.7, 0.9)
+                    
+                    # Render part mesh for each cluster grasp
+                    if part_mesh_o3d is not None:
+                        part_mesh_data = _open3d_to_viser_mesh_data(part_mesh_o3d, color=(0.9, 0.7, 0.3))
+                        add_mesh_to_viser_scene(
+                            server,
+                            f"/part_{display_idx}_cluster_{cluster_idx}",
+                            part_mesh_data,
+                            transform=part_T_display,
+                        )
+                        # Add coordinate frame for part
+                        # add_frame_to_viser_scene(
+                        #     server,
+                        #     f"/part_frame_{display_idx}_cluster_{cluster_idx}",
+                        #     part_T_display,
+                        #     size=0.05,
+                        # )
+
+                    if gripper_mesh_o3d is not None:
+                        gripper_mesh_data = _open3d_to_viser_mesh_data(gripper_mesh_o3d, color=gripper_rgb)
+                        add_mesh_to_viser_scene(
+                            server,
+                            f"/gripper_{display_idx}_cluster_{cluster_idx}",
+                            gripper_mesh_data,
+                            transform=ee_T_display,
+                        )
+                        # Add small coordinate frame for gripper
+                        # add_frame_to_viser_scene(
+                        #     server,
+                        #     f"/gripper_frame_{display_idx}_cluster_{cluster_idx}",
+                        #     ee_T_display,
+                        #     size=0.03,
+                        # )
+
+                display_idx += 1
+                
+                # Print cluster information
+                print(f"  {part_name}: {len(valid_clusters)} cluster(s)")
+                for cluster_idx, cluster_grasp in enumerate(valid_clusters):
+                    cluster_id = cluster_grasp["cluster_id"]
+                    cluster_size = cluster_grasp["cluster_size"]
+                    print(f"    Cluster {cluster_idx} (id={cluster_id}, size={cluster_size})")
+            
+            print(f"\nVisualizing with viser...")
+            print("Open your browser to the URL shown above to view the visualization.")
+            print("Press Ctrl+C to exit.")
+            
+            try:
+                import time
+                while True:
+                    time.sleep(0.1)
+            except KeyboardInterrupt:
+                print("\nExiting...")
+        else:
+            o3d = _ensure_open3d()
+            geometries = []
+
+            gripper_mesh = None
+            try:
+                gripper_mesh = _load_gripper_mesh()
+            except Exception as exc:
+                print(f"Warning: unable to load gripper mesh: {exc}")
+
+            for part_name in parts:
+                if part_name not in parts_stats:
+                    print(f"Part '{part_name}' not in summary for {furniture_name}, skipping")
+                    continue
+
+                stats = parts_stats[part_name]
+                
+                # Get cluster grasps
+                cluster_grasps = stats.get("cluster_grasps", [])
+                if not cluster_grasps:
+                    print(f"No cluster grasps found for '{part_name}', skipping")
+                    continue
+                
+                # Filter out noise clusters (cluster_id == -1) for visualization
+                valid_clusters = [cg for cg in cluster_grasps if cg["cluster_id"] >= 0]
+                if not valid_clusters:
+                    # Fall back to all clusters if no valid ones
+                    valid_clusters = cluster_grasps
+                
+                part_conf = furniture_conf.get(part_name)
+                if not isinstance(part_conf, dict) or "asset_file" not in part_conf:
+                    print(f"Part config missing asset file for '{part_name}', skipping mesh rendering")
+                    continue
+
+                try:
+                    part_mesh = _load_part_mesh(part_conf["asset_file"])
+                except Exception as exc:
+                    print(f"Warning: unable to load mesh for part '{part_name}': {exc}")
+                    part_mesh = None
+
+                # Visualize each cluster grasp
+                for cluster_idx, cluster_grasp in enumerate(valid_clusters):
+                    rel_pos = np.array(cluster_grasp["relative_position"], dtype=np.float64)
+                    rel_quat = np.array(cluster_grasp["relative_quaternion"], dtype=np.float64)
+                    rel_quat = _quat_normalize(rel_quat)
+                    
+                    cluster_id = cluster_grasp["cluster_id"]
+                    cluster_size = cluster_grasp["cluster_size"]
+
+                    rel_T = _pose_vec_to_mat(rel_pos, rel_quat)
+                    rel_T_inv = np.linalg.inv(rel_T)
+
+                    # Use the original/oriented part pose (identity transform)
+                    # Offset each cluster horizontally, and each part vertically
+                    part_T = np.eye(4)
+                    offset_x = 0.5 * cluster_idx  # Horizontal offset for clusters
+                    offset_y = 0.8 * display_idx  # Vertical offset for parts
+                    offset = np.array([offset_x, offset_y, 0.0])
+                    part_T_display = part_T.copy()
+                    part_T_display[:3, 3] = offset
+
+                    ee_T_display = part_T_display @ rel_T_inv
+
+                    # Color code: part in orange/yellow, gripper color varies by cluster
+                    # Use a color palette that cycles through different hues
+                    hue = (cluster_idx * 0.618) % 1.0  # Golden ratio for better color distribution
+                    gripper_rgb = colorsys.hsv_to_rgb(hue, 0.7, 0.9)
+                    
+                    # Render part mesh for each cluster grasp
+                    if part_mesh is not None:
+                        geometries.append(
+                            _mesh_with_transform(
+                                part_mesh,
+                                part_T_display,
+                                color=(0.9, 0.7, 0.3),
+                            )
+                        )
+                        # Add coordinate frame for part
+                        geometries.append(
+                            o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05).translate(offset)
+                        )
+
+                    if gripper_mesh is not None:
+                        geometries.append(
+                            _mesh_with_transform(
+                                gripper_mesh,
+                                ee_T_display,
+                                color=gripper_rgb,
+                            )
+                        )
+                        # Add small coordinate frame for gripper
+                        gripper_frame_size = 0.03
+                        gripper_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+                            size=gripper_frame_size
+                        ).transform(ee_T_display)
+                        geometries.append(gripper_frame)
+                    
+                    # Add text label (as a small sphere) to indicate cluster info
+                    # Note: open3d doesn't support text, so we'll use a colored sphere
+                    label_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.01)
+                    label_sphere.translate(offset + np.array([0.0, 0.0, 0.15]))
+                    label_sphere.paint_uniform_color(gripper_rgb)
+                    geometries.append(label_sphere)
+
+                display_idx += 1
+                
+                # Print cluster information
+                print(f"  {part_name}: {len(valid_clusters)} cluster(s)")
+                for cluster_idx, cluster_grasp in enumerate(valid_clusters):
+                    cluster_id = cluster_grasp["cluster_id"]
+                    cluster_size = cluster_grasp["cluster_size"]
+                    print(f"    Cluster {cluster_idx} (id={cluster_id}, size={cluster_size})")
+
+            if not geometries:
+                print(f"No geometries to render for {furniture_name}")
+                continue
+
+            o3d.visualization.draw_geometries(
+                geometries,
+                window_name=f"All cluster grasps for {furniture_name}",
+            )
 
 
 def _detect_grasp_labels(
@@ -1041,14 +1461,20 @@ def _render_demonstration_video(
     cv2.destroyWindow(window_title)
 
 
-def main():
-    args = parse_args()
-    dataset_root = Path(args.dataset).expanduser().resolve()
-    annotation_files = list(_iter_annotation_files(dataset_root))
-
-    if not annotation_files:
-        raise FileNotFoundError(f"No .pkl files found under {dataset_root}")
-
+def _load_grasps_from_file(grasps_path: Path) -> Dict[str, Dict[str, Dict[str, List[np.ndarray]]]]:
+    """
+    Load aggregate_store from a file (supports both .pkl and .json formats).
+    
+    Args:
+        grasps_path: Path to the grasps file
+    
+    Returns:
+        aggregate_store dictionary with numpy arrays
+    """
+    grasps_path = grasps_path.expanduser().resolve()
+    if not grasps_path.is_file():
+        raise FileNotFoundError(f"Grasps file not found: {grasps_path}")
+    
     def _make_part_store():
         return {
             "relative_pos": [],
@@ -1058,54 +1484,110 @@ def main():
             "part_pos": [],
             "part_quat": [],
         }
+    
+    if grasps_path.suffix == ".pkl":
+        # Load from pickle
+        with open(grasps_path, "rb") as f:
+            aggregate_store = pickle.load(f)
+    elif grasps_path.suffix == ".json":
+        # Load from JSON and convert back to numpy arrays
+        with open(grasps_path, "r", encoding="utf-8") as f:
+            json_store = json.load(f)
+        
+        aggregate_store = defaultdict(lambda: defaultdict(_make_part_store))
+        for furniture_name, parts_data in json_store.items():
+            for part_name, samples in parts_data.items():
+                aggregate_store[furniture_name][part_name] = {
+                    "relative_pos": [np.array(arr) for arr in samples["relative_pos"]],
+                    "relative_quat": [np.array(arr) for arr in samples["relative_quat"]],
+                    "ee_pos": [np.array(arr) for arr in samples["ee_pos"]],
+                    "ee_quat": [np.array(arr) for arr in samples["ee_quat"]],
+                    "part_pos": [np.array(arr) for arr in samples["part_pos"]],
+                    "part_quat": [np.array(arr) for arr in samples["part_quat"]],
+                }
+    else:
+        raise ValueError(f"Unsupported file format: {grasps_path.suffix}. Expected .pkl or .json")
+    
+    return aggregate_store
 
-    aggregate_store: Dict[str, Dict[str, Dict[str, List[np.ndarray]]]] = defaultdict(
-        lambda: defaultdict(_make_part_store)
-    )
 
-    for idx, annotation_path in enumerate(annotation_files):
-        print(f"Processing {idx+1} / {len(annotation_files)}: {annotation_path}")
-        with open(annotation_path, "rb") as f:
-            data = pickle.load(f)
+def main():
+    args = parse_args()
+    
+    # Check if we should load from file or extract from dataset
+    if args.grasps is not None:
+        # Load from saved grasps file
+        print(f"Loading grasps from: {args.grasps}")
+        aggregate_store = _load_grasps_from_file(args.grasps)
+        print(f"Loaded grasps for {len(aggregate_store)} furniture type(s)")
+    else:
+        # Extract from dataset
+        if args.dataset is None:
+            raise ValueError("Either --dataset or --grasps must be specified")
+        
+        dataset_root = Path(args.dataset).expanduser().resolve()
+        annotation_files = list(_iter_annotation_files(dataset_root))
 
-        furniture_name = args.furniture or data.get("furniture")
-        if furniture_name is None:
-            raise ValueError(
-                f"Furniture name not provided via --furniture or dataset metadata for {annotation_path}"
-            )
+        if not annotation_files:
+            raise FileNotFoundError(f"No .pkl files found under {dataset_root}")
 
-        furniture = furniture_factory(furniture_name)
-        part_names = [part.name for part in furniture.parts]
-        thresholds = _prepare_thresholds(furniture_name, args)
-        robot_from_april = config["robot"]["tag_base_from_robot_base"]
+        def _make_part_store():
+            return {
+                "relative_pos": [],
+                "relative_quat": [],
+                "ee_pos": [],
+                "ee_quat": [],
+                "part_pos": [],
+                "part_quat": [],
+            }
 
-        observations = data.get("observations", [])
+        aggregate_store: Dict[str, Dict[str, Dict[str, List[np.ndarray]]]] = defaultdict(
+            lambda: defaultdict(_make_part_store)
+        )
 
-        if args.render_video and observations:
-            grasp_labels = _detect_grasp_labels(
+        for idx, annotation_path in enumerate(annotation_files):
+            print(f"Processing {idx+1} / {len(annotation_files)}: {annotation_path}")
+            with open(annotation_path, "rb") as f:
+                data = pickle.load(f)
+
+            furniture_name = args.furniture or data.get("furniture")
+            if furniture_name is None:
+                raise ValueError(
+                    f"Furniture name not provided via --furniture or dataset metadata for {annotation_path}"
+                )
+
+            furniture = furniture_factory(furniture_name)
+            part_names = [part.name for part in furniture.parts]
+            thresholds = _prepare_thresholds(furniture_name, args)
+            robot_from_april = config["robot"]["tag_base_from_robot_base"]
+
+            observations = data.get("observations", [])
+
+            if args.render_video and observations:
+                grasp_labels = _detect_grasp_labels(
+                    observations,
+                    part_names,
+                    thresholds,
+                    robot_from_april,
+                    furniture_name,
+                )
+                window_title = f"{furniture_name} - {annotation_path.stem}" if hasattr(annotation_path, "stem") else str(annotation_path)
+                _render_demonstration_video(
+                    observations,
+                    grasp_labels,
+                    window_title=window_title,
+                )
+
+            _analyze_observations(
+                furniture_name,
                 observations,
                 part_names,
                 thresholds,
                 robot_from_april,
-                furniture_name,
+                aggregate_store,
+                visualize_contact=args.visualize_contact,
+                visualize_contact_limit=args.visualize_contact_limit,
             )
-            window_title = f"{furniture_name} - {annotation_path.stem}" if hasattr(annotation_path, "stem") else str(annotation_path)
-            _render_demonstration_video(
-                observations,
-                grasp_labels,
-                window_title=window_title,
-            )
-
-        _analyze_observations(
-            furniture_name,
-            observations,
-            part_names,
-            thresholds,
-            robot_from_april,
-            aggregate_store,
-            visualize_contact=args.visualize_contact,
-            visualize_contact_limit=args.visualize_contact_limit,
-        )
 
     summary = _summarize(aggregate_store)
 
@@ -1117,35 +1599,21 @@ def main():
         
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save summary.json
-        summary_path = output_dir / "grasp_summary.json"
-        with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
+        # Save summary.pkl
+        summary_path = output_dir / "grasp_summary.pkl"
+        with open(summary_path, "wb") as f:
+            pickle.dump(summary, f)
         print(f"\nSaved summary to {summary_path}")
         
-        # Convert aggregate_store to JSON-serializable format
-        def convert_aggregate_store(store):
-            """Convert numpy arrays in aggregate_store to lists for JSON serialization."""
-            json_store = {}
-            for furniture_name, parts_data in store.items():
-                json_store[furniture_name] = {}
-                for part_name, samples in parts_data.items():
-                    json_store[furniture_name][part_name] = {
-                        "relative_pos": [arr.tolist() for arr in samples["relative_pos"]],
-                        "relative_quat": [arr.tolist() for arr in samples["relative_quat"]],
-                        "ee_pos": [arr.tolist() for arr in samples["ee_pos"]],
-                        "ee_quat": [arr.tolist() for arr in samples["ee_quat"]],
-                        "part_pos": [arr.tolist() for arr in samples["part_pos"]],
-                        "part_quat": [arr.tolist() for arr in samples["part_quat"]],
-                    }
-            return json_store
-        
-        # Save aggregate_store.json
-        aggregate_store_path = output_dir / "grasps.json"
-        json_aggregate_store = convert_aggregate_store(aggregate_store)
-        with open(aggregate_store_path, "w", encoding="utf-8") as f:
-            json.dump(json_aggregate_store, f, indent=2)
-        print(f"Saved aggregate_store to {aggregate_store_path}")
+        # Only save aggregate_store if we extracted from dataset (not loaded from file)
+        if args.grasps is None:
+            # Save aggregate_store.pkl
+            aggregate_store_path = output_dir / "grasps.pkl"
+            with open(aggregate_store_path, "wb") as f:
+                pickle.dump(aggregate_store, f)
+            print(f"Saved aggregate_store to {aggregate_store_path}")
+        else:
+            print("Skipping aggregate_store save (loaded from --grasps file)")
 
     if args.render:
         render_furniture = args.render_furniture or args.furniture

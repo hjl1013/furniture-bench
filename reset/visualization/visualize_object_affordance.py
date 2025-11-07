@@ -65,6 +65,7 @@ def visualize_trajectory(
     sample_idx: int = 0,
     fps: int = 30,
     show_trace: bool = True,
+    use_viser: bool = False,
 ):
     if not json_path.is_file():
         raise FileNotFoundError(f"JSON file not found: {json_path}")
@@ -119,8 +120,6 @@ def visualize_trajectory(
     if not TRIMESH_AVAILABLE or _load_part_mesh_trimesh is None or _trimesh_to_open3d is None or _ensure_open3d is None:
         raise ImportError("Visualization requires the project's extract_grasp helpers and Open3D/trimesh. Ensure dependencies are installed.")
 
-    o3d = _ensure_open3d()
-
     # Load trimesh meshes - these are in each part's local coordinate frame
     mesh_base_tm = _load_part_mesh_trimesh(base_conf["asset_file"])  # trimesh.Trimesh
     mesh_target_tm = _load_part_mesh_trimesh(target_conf["asset_file"])  # trimesh.Trimesh
@@ -130,120 +129,200 @@ def visualize_trajectory(
     base_vertices_orig = mesh_base_tm.vertices.copy()  # Base part vertices in base's local frame (at origin)
     target_vertices_orig = mesh_target_tm.vertices.copy()  # Target part vertices in target's local frame
 
-    # Convert to open3d for visualization
-    mesh_base_o3d = _trimesh_to_open3d(mesh_base_tm)
-    mesh_target_o3d = _trimesh_to_open3d(mesh_target_tm)
-
-    mesh_base_o3d.compute_vertex_normals()
-    mesh_target_o3d.compute_vertex_normals()
-
-    # Color base and target
-    mesh_base_o3d.paint_uniform_color([0.8, 0.7, 0.3])  # orange
-    mesh_target_o3d.paint_uniform_color([0.2, 0.5, 0.9])  # blue
-
-    # Ensure base part is positioned at origin in its own coordinate frame
-    # Base part defines the coordinate frame, so it stays fixed
-    mesh_base_o3d.vertices = o3d.utility.Vector3dVector(base_vertices_orig)
-    mesh_base_o3d.compute_vertex_normals()
-
-    # Prepare trajectory line set
-    if show_trace:
-        points = [list(np.zeros(3))]
-        lines = []
-        colors = []
-        traj_lineset = o3d.geometry.LineSet(
-            points=o3d.utility.Vector3dVector(points),
-            lines=o3d.utility.Vector2iVector(lines),
+    if use_viser:
+        from reset.visualization.viser_utils import (
+            create_viser_server,
+            add_mesh_to_viser_scene,
+            update_mesh_in_viser_scene,
+            add_frame_to_viser_scene,
+            add_line_set_to_viser_scene,
+            update_line_set_in_viser_scene,
+            _trimesh_to_viser_mesh_data,
+            VISER_AVAILABLE,
         )
-        traj_lineset.colors = o3d.utility.Vector3dVector(colors)
-    else:
-        traj_lineset = None
-
-    # Create coordinate frame for base
-    base_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
-
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name=f"Affordance: {base_part} <- {target_part}")
-    vis.add_geometry(mesh_base_o3d)
-    vis.add_geometry(mesh_target_o3d)
-    vis.add_geometry(base_frame)
-    if traj_lineset is not None:
-        vis.add_geometry(traj_lineset)
-
-    # Optionally set a nicer camera view (leave interactive)
-    opt = vis.get_render_option()
-    opt.mesh_show_back_face = True
-
-    # Animation loop
-    frame_dt = 1.0 / max(1, fps)
-    prev_time = time.time()
-
-    # For each frame: apply the relative pose transform directly to original target vertices
-    # The relative pose (rel_pose) represents the pose of target part in base part's coordinate frame
-    # We transform target vertices from target's local frame to base frame using this relative pose
-    # IMPORTANT: Always use target_vertices_orig (original vertices in target's local frame) 
-    #            and apply rel_mat transform - never accumulate transforms
-    points_accum = []
-    for idx in range(traj_arr.shape[0]):
-        # Get relative pose: pose of target part in base part's coordinate frame
-        rel_pose = traj_arr[idx]
+        if not VISER_AVAILABLE:
+            raise ImportError("viser is required for viser visualization. Install with: pip install viser")
         
-        # Convert to 4x4 transformation matrix
-        # rel_mat transforms points from target's local coordinate frame to base coordinate frame
-        rel_mat = T.pose2mat(rel_pose)
+        server = create_viser_server(title=f"Affordance: {base_part} <- {target_part}")
+        
+        # Add base mesh (fixed at origin)
+        base_mesh_data = _trimesh_to_viser_mesh_data(mesh_base_tm, color=(0.8, 0.7, 0.3))
+        add_mesh_to_viser_scene(server, "/base", base_mesh_data)
+        
+        # Add base frame
+        identity_transform = np.eye(4)
+        # add_frame_to_viser_scene(server, "/base_frame", identity_transform, size=0.05)
+        
+        # Add target mesh (will be updated in animation)
+        target_mesh_data = _trimesh_to_viser_mesh_data(mesh_target_tm, color=(0.2, 0.5, 0.9))
+        add_mesh_to_viser_scene(server, "/target", target_mesh_data)
+        
+        # Animation loop
+        frame_dt = 1.0 / max(1, fps)
+        prev_time = time.time()
+        points_accum = []
+        
+        print(f"\nAnimating trajectory ({len(traj_arr)} frames) with viser...")
+        print("Open your browser to the URL shown above to view the visualization.")
+        print("Press Ctrl+C to exit.")
+        
+        for idx in range(traj_arr.shape[0]):
+            rel_pose = traj_arr[idx]
+            rel_mat = T.pose2mat(rel_pose)
+            
+            # Update target mesh
+            transformed_vertices = _apply_transform_to_vertices(target_vertices_orig, rel_mat)
+            target_mesh_data_updated = {
+                "vertices": transformed_vertices,
+                "faces": target_mesh_data["faces"],
+                "vertex_colors": target_mesh_data.get("vertex_colors"),
+            }
+            update_mesh_in_viser_scene(server, "/target", target_mesh_data_updated)
+            
+            # Update trace
+            if show_trace:
+                origin_in_target_frame = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+                origin_in_base_frame_homo = rel_mat @ origin_in_target_frame
+                w = origin_in_base_frame_homo[3]
+                if np.abs(w) > 1e-10:
+                    point = origin_in_base_frame_homo[:3] / w
+                else:
+                    point = origin_in_base_frame_homo[:3]
+                points_accum.append(point)
+                
+                if len(points_accum) >= 2:
+                    pts = np.asarray(points_accum)
+                    update_line_set_in_viser_scene(server, "/trace", pts, color=(0.9, 0.1, 0.1))
+            
+            # Maintain playback speed
+            elapsed = time.time() - prev_time
+            sleep = max(0.0, frame_dt - elapsed)
+            time.sleep(sleep)
+            prev_time = time.time()
+        
+        print("Animation finished — window remains open for inspection. Press Ctrl+C to exit.")
+        try:
+            while True:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\nExiting...")
+    else:
+        o3d = _ensure_open3d()
 
-        # Apply transform to ORIGINAL target vertices (in target's local frame)
-        # This transforms them to base frame coordinates
-        # Each frame applies this transform independently - no accumulation
-        transformed_vertices = _apply_transform_to_vertices(target_vertices_orig, rel_mat)
-        mesh_target_o3d.vertices = o3d.utility.Vector3dVector(transformed_vertices)
+        # Convert to open3d for visualization
+        mesh_base_o3d = _trimesh_to_open3d(mesh_base_tm)
+        mesh_target_o3d = _trimesh_to_open3d(mesh_target_tm)
+
+        mesh_base_o3d.compute_vertex_normals()
         mesh_target_o3d.compute_vertex_normals()
 
-        # Update trace: transform origin of target part (in target's local frame) to base frame
+        # Color base and target
+        mesh_base_o3d.paint_uniform_color([0.8, 0.7, 0.3])  # orange
+        mesh_target_o3d.paint_uniform_color([0.2, 0.5, 0.9])  # blue
+
+        # Ensure base part is positioned at origin in its own coordinate frame
+        # Base part defines the coordinate frame, so it stays fixed
+        mesh_base_o3d.vertices = o3d.utility.Vector3dVector(base_vertices_orig)
+        mesh_base_o3d.compute_vertex_normals()
+
+        # Prepare trajectory line set
+        if show_trace:
+            points = [list(np.zeros(3))]
+            lines = []
+            colors = []
+            traj_lineset = o3d.geometry.LineSet(
+                points=o3d.utility.Vector3dVector(points),
+                lines=o3d.utility.Vector2iVector(lines),
+            )
+            traj_lineset.colors = o3d.utility.Vector3dVector(colors)
+        else:
+            traj_lineset = None
+
+        # Create coordinate frame for base
+        base_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
+
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(window_name=f"Affordance: {base_part} <- {target_part}")
+        vis.add_geometry(mesh_base_o3d)
+        vis.add_geometry(mesh_target_o3d)
+        vis.add_geometry(base_frame)
         if traj_lineset is not None:
-            origin_in_target_frame = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
-            origin_in_base_frame_homo = rel_mat @ origin_in_target_frame
-            # Normalize by w component
-            w = origin_in_base_frame_homo[3]
-            if np.abs(w) > 1e-10:
-                point = origin_in_base_frame_homo[:3] / w
-            else:
-                point = origin_in_base_frame_homo[:3]  # fallback (shouldn't happen for affine)
-            points_accum.append(point.tolist())
-            # rebuild line set
-            pts = np.asarray(points_accum)
-            if pts.shape[0] >= 2:
-                lines = [[i, i + 1] for i in range(pts.shape[0] - 1)]
-                colors = [[0.9, 0.1, 0.1] for _ in range(len(lines))]
-                traj_lineset.points = o3d.utility.Vector3dVector(pts)
-                traj_lineset.lines = o3d.utility.Vector2iVector(lines)
-                traj_lineset.colors = o3d.utility.Vector3dVector(colors)
-            else:
-                traj_lineset.points = o3d.utility.Vector3dVector(pts)
-                traj_lineset.lines = o3d.utility.Vector2iVector([])
-                traj_lineset.colors = o3d.utility.Vector3dVector([])
+            vis.add_geometry(traj_lineset)
 
-            vis.update_geometry(traj_lineset)
+        # Optionally set a nicer camera view (leave interactive)
+        opt = vis.get_render_option()
+        opt.mesh_show_back_face = True
 
-        vis.update_geometry(mesh_target_o3d)
-        vis.poll_events()
-        vis.update_renderer()
-
-        # maintain playback speed but keep UI responsive
-        elapsed = time.time() - prev_time
-        sleep = max(0.0, frame_dt - elapsed)
-        time.sleep(sleep)
+        # Animation loop
+        frame_dt = 1.0 / max(1, fps)
         prev_time = time.time()
 
-    print("Animation finished — window remains open for inspection. Close it to exit.")
-    # keep window open until closed by user
-    while True:
-        try:
+        # For each frame: apply the relative pose transform directly to original target vertices
+        # The relative pose (rel_pose) represents the pose of target part in base part's coordinate frame
+        # We transform target vertices from target's local frame to base frame using this relative pose
+        # IMPORTANT: Always use target_vertices_orig (original vertices in target's local frame) 
+        #            and apply rel_mat transform - never accumulate transforms
+        points_accum = []
+        for idx in range(traj_arr.shape[0]):
+            # Get relative pose: pose of target part in base part's coordinate frame
+            rel_pose = traj_arr[idx]
+            
+            # Convert to 4x4 transformation matrix
+            # rel_mat transforms points from target's local coordinate frame to base coordinate frame
+            rel_mat = T.pose2mat(rel_pose)
+
+            # Apply transform to ORIGINAL target vertices (in target's local frame)
+            # This transforms them to base frame coordinates
+            # Each frame applies this transform independently - no accumulation
+            transformed_vertices = _apply_transform_to_vertices(target_vertices_orig, rel_mat)
+            mesh_target_o3d.vertices = o3d.utility.Vector3dVector(transformed_vertices)
+            mesh_target_o3d.compute_vertex_normals()
+
+            # Update trace: transform origin of target part (in target's local frame) to base frame
+            if traj_lineset is not None:
+                origin_in_target_frame = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+                origin_in_base_frame_homo = rel_mat @ origin_in_target_frame
+                # Normalize by w component
+                w = origin_in_base_frame_homo[3]
+                if np.abs(w) > 1e-10:
+                    point = origin_in_base_frame_homo[:3] / w
+                else:
+                    point = origin_in_base_frame_homo[:3]  # fallback (shouldn't happen for affine)
+                points_accum.append(point.tolist())
+                # rebuild line set
+                pts = np.asarray(points_accum)
+                if pts.shape[0] >= 2:
+                    lines = [[i, i + 1] for i in range(pts.shape[0] - 1)]
+                    colors = [[0.9, 0.1, 0.1] for _ in range(len(lines))]
+                    traj_lineset.points = o3d.utility.Vector3dVector(pts)
+                    traj_lineset.lines = o3d.utility.Vector2iVector(lines)
+                    traj_lineset.colors = o3d.utility.Vector3dVector(colors)
+                else:
+                    traj_lineset.points = o3d.utility.Vector3dVector(pts)
+                    traj_lineset.lines = o3d.utility.Vector2iVector([])
+                    traj_lineset.colors = o3d.utility.Vector3dVector([])
+
+                vis.update_geometry(traj_lineset)
+
+            vis.update_geometry(mesh_target_o3d)
             vis.poll_events()
             vis.update_renderer()
-            time.sleep(0.02)
-        except KeyboardInterrupt:
-            break
+
+            # maintain playback speed but keep UI responsive
+            elapsed = time.time() - prev_time
+            sleep = max(0.0, frame_dt - elapsed)
+            time.sleep(sleep)
+            prev_time = time.time()
+
+        print("Animation finished — window remains open for inspection. Close it to exit.")
+        # keep window open until closed by user
+        while True:
+            try:
+                vis.poll_events()
+                vis.update_renderer()
+                time.sleep(0.02)
+            except KeyboardInterrupt:
+                break
 
 
 def parse_args():
@@ -254,13 +333,14 @@ def parse_args():
     p.add_argument("--sample", type=int, default=0, help="Index of trajectory sample to visualize")
     p.add_argument("--fps", type=float, default=30.0, help="Playback frames per second")
     p.add_argument("--no-trace", dest="trace", action="store_false", help="Do not show trajectory trace")
+    p.add_argument("--use-viser", action="store_true", help="Use viser for visualization instead of Open3D")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     base, target = args.pair[0], args.pair[1]
-    visualize_trajectory(args.json, args.furniture, base, target, sample_idx=args.sample, fps=args.fps, show_trace=args.trace)
+    visualize_trajectory(args.json, args.furniture, base, target, sample_idx=args.sample, fps=args.fps, show_trace=args.trace, use_viser=args.use_viser)
 
 
 if __name__ == '__main__':

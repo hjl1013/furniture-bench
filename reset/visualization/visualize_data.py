@@ -36,9 +36,9 @@ def visualize_frame(
     frame_idx: int,
     show_images: bool = True,
     show_gripper: bool = True,
+    use_viser: bool = False,
 ):
     """Visualize a single observation frame with part meshes, robot origin, and EEF pose."""
-    o3d = _ensure_open3d()
     
     robot_state = obs.get("robot_state")
     parts_poses = obs.get("parts_poses")
@@ -217,17 +217,170 @@ def visualize_frame(
         print(f"    Position: [{part_pos[0]:.4f}, {part_pos[1]:.4f}, {part_pos[2]:.4f}]")
         print(f"    Quaternion: [{part_quat[0]:.4f}, {part_quat[1]:.4f}, {part_quat[2]:.4f}, {part_quat[3]:.4f}]")
     
-    print(f"\nVisualization Controls:")
-    print(f"  - Mouse: Rotate (left drag), Pan (right drag), Zoom (scroll)")
-    print(f"  - Press 'Q' or close window to continue to next frame")
-    
-    # Visualize
-    o3d.visualization.draw_geometries(
-        geometries,
-        window_name=f"Frame {frame_idx} - {furniture_name}",
-        width=1280,
-        height=720,
-    )
+    if use_viser:
+        from reset.visualization.viser_utils import (
+            create_viser_server,
+            add_mesh_to_viser_scene,
+            add_frame_to_viser_scene,
+            _open3d_to_viser_mesh_data,
+            VISER_AVAILABLE,
+        )
+        if not VISER_AVAILABLE:
+            raise ImportError("viser is required for viser visualization. Install with: pip install viser")
+        
+        server = create_viser_server(title=f"Frame {frame_idx} - {furniture_name}")
+        
+        # Add robot origin frame
+        identity_transform = np.eye(4)
+        add_frame_to_viser_scene(server, "/robot_origin", identity_transform, size=0.1)
+        
+        # Add AprilTag frame
+        add_frame_to_viser_scene(server, "/april_tag", robot_from_april, size=0.1)
+        
+        # Add EEF frame
+        add_frame_to_viser_scene(server, "/eef", ee_T, size=0.08)
+        
+        # Add gripper mesh
+        if show_gripper:
+            try:
+                gripper_mesh = _load_gripper_mesh()
+                gripper_mesh_data = _open3d_to_viser_mesh_data(gripper_mesh, color=(0.3, 0.5, 0.9))
+                add_mesh_to_viser_scene(server, "/gripper", gripper_mesh_data, transform=ee_T)
+            except Exception as e:
+                print(f"Warning: Could not load gripper mesh: {e}")
+        
+        # Add part meshes
+        part_colors = [
+            (0.9, 0.7, 0.3),  # Orange
+            (0.9, 0.3, 0.7),  # Pink
+            (0.3, 0.9, 0.7),  # Cyan
+            (0.7, 0.3, 0.9),  # Purple
+            (0.7, 0.9, 0.3),  # Yellow-green
+            (0.3, 0.7, 0.9),  # Light blue
+        ]
+        
+        for part_idx, part_name in enumerate(part_names):
+            part_pose_vec = parts_array[part_idx]
+            part_pose_mat_april = T.pose2mat(part_pose_vec)
+            part_pose_mat_robot = robot_from_april @ part_pose_mat_april
+            
+            # Load part mesh
+            part_conf = furniture_conf.get(part_name)
+            if not isinstance(part_conf, dict) or "asset_file" not in part_conf:
+                continue
+            
+            try:
+                part_mesh = _load_part_mesh(part_conf["asset_file"])
+            except Exception as e:
+                continue
+            
+            color = part_colors[part_idx % len(part_colors)]
+            part_mesh_data = _open3d_to_viser_mesh_data(part_mesh, color=color)
+            add_mesh_to_viser_scene(server, f"/part_{part_name}", part_mesh_data, transform=part_pose_mat_robot)
+            add_frame_to_viser_scene(server, f"/part_frame_{part_name}", part_pose_mat_robot, size=0.06)
+        
+        print(f"\nVisualization Controls:")
+        print(f"  - Open your browser to the URL shown above")
+        print(f"  - Press Ctrl+C to continue to next frame")
+        
+        try:
+            import time
+            time.sleep(0.5)  # Give viser time to initialize
+            input("Press Enter to continue to next frame...")
+        except KeyboardInterrupt:
+            pass
+    else:
+        o3d = _ensure_open3d()
+        
+        # Collect geometries for visualization
+        geometries = []
+        
+        # 1. Robot origin frame (at identity - origin)
+        robot_origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=0.1, origin=[0, 0, 0]
+        )
+        geometries.append(robot_origin_frame)
+        
+        # 2. AprilTag base frame (in robot frame)
+        april_tag_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=0.1, origin=[0, 0, 0]
+        )
+        april_tag_frame.transform(robot_from_april)
+        april_tag_frame.paint_uniform_color([1.0, 1.0, 0.0])  # Yellow
+        geometries.append(april_tag_frame)
+        
+        # 3. EEF pose frame
+        eef_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=0.08, origin=ee_T[:3, 3]
+        )
+        eef_frame.paint_uniform_color([0.0, 1.0, 0.0])  # Green
+        geometries.append(eef_frame)
+        
+        # 4. Load and visualize gripper mesh at EEF pose
+        if show_gripper:
+            try:
+                gripper_mesh = _load_gripper_mesh()
+                gripper_transformed = copy.deepcopy(gripper_mesh)
+                gripper_transformed.transform(ee_T)
+                gripper_transformed.paint_uniform_color([0.3, 0.5, 0.9])  # Blue
+                geometries.append(gripper_transformed)
+            except Exception as e:
+                print(f"Warning: Could not load gripper mesh: {e}")
+        
+        # 5. Load and visualize part meshes at their poses
+        part_colors = [
+            [0.9, 0.7, 0.3],  # Orange
+            [0.9, 0.3, 0.7],  # Pink
+            [0.3, 0.9, 0.7],  # Cyan
+            [0.7, 0.3, 0.9],  # Purple
+            [0.7, 0.9, 0.3],  # Yellow-green
+            [0.3, 0.7, 0.9],  # Light blue
+        ]
+        
+        for part_idx, part_name in enumerate(part_names):
+            part_pose_vec = parts_array[part_idx]
+            part_pose_mat_april = T.pose2mat(part_pose_vec)
+            part_pose_mat_robot = robot_from_april @ part_pose_mat_april
+            
+            # Load part mesh
+            part_conf = furniture_conf.get(part_name)
+            if not isinstance(part_conf, dict) or "asset_file" not in part_conf:
+                print(f"Warning: Part '{part_name}' missing asset file, skipping")
+                continue
+            
+            try:
+                part_mesh = _load_part_mesh(part_conf["asset_file"])
+            except Exception as e:
+                print(f"Warning: Could not load mesh for part '{part_name}': {e}")
+                continue
+            
+            # Transform part mesh to robot frame
+            part_transformed = copy.deepcopy(part_mesh)
+            part_transformed.transform(part_pose_mat_robot)
+            
+            # Color part mesh
+            color = part_colors[part_idx % len(part_colors)]
+            part_transformed.paint_uniform_color(color)
+            geometries.append(part_transformed)
+            
+            # Add coordinate frame for part
+            part_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+                size=0.06, origin=part_pose_mat_robot[:3, 3]
+            )
+            part_frame.paint_uniform_color(color)
+            geometries.append(part_frame)
+        
+        print(f"\nVisualization Controls:")
+        print(f"  - Mouse: Rotate (left drag), Pan (right drag), Zoom (scroll)")
+        print(f"  - Press 'Q' or close window to continue to next frame")
+        
+        # Visualize
+        o3d.visualization.draw_geometries(
+            geometries,
+            window_name=f"Frame {frame_idx} - {furniture_name}",
+            width=1280,
+            height=720,
+        )
 
 
 def main():
@@ -271,6 +424,11 @@ def main():
         "--no-gripper",
         action="store_true",
         help="Don't show gripper mesh, only coordinate frame"
+    )
+    parser.add_argument(
+        "--use-viser",
+        action="store_true",
+        help="Use viser for visualization instead of Open3D"
     )
     args = parser.parse_args()
     
@@ -335,6 +493,7 @@ def main():
                 frame_idx,
                 show_images=not args.no_images,
                 show_gripper=not args.no_gripper,
+                use_viser=args.use_viser,
             )
     except KeyboardInterrupt:
         print("\n\nVisualization interrupted by user")
