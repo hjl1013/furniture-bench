@@ -88,6 +88,12 @@ def main():
         help="GPU device ID used for rendering.",
     )
 
+    parser.add_argument(
+        "--use-viser",
+        action="store_true",
+        help="Use Viser for rendering.",
+    )
+
     parser.add_argument("--num-envs", type=int, default=1)
     args = parser.parse_args()
 
@@ -106,6 +112,7 @@ def main():
         act_rot_repr=args.act_rot_repr,
         compute_device_id=args.compute_device_id,
         graphics_device_id=args.graphics_device_id,
+        use_viser=args.use_viser,
     )
 
     # Initialize FurnitureSim.
