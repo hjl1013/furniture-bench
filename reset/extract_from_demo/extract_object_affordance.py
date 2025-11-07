@@ -120,7 +120,7 @@ def _process_annotations(
             continue
 
         observations = data.get("observations", [])
-        robot_from_april = np.linalg.inv(config["robot"]["tag_base_from_robot_base"])
+        robot_from_april = config["robot"]["tag_base_from_robot_base"]
 
         # Prepare per-pair state trackers
         # keys are (i,j) indices with i<j

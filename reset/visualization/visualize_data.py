@@ -300,7 +300,7 @@ def main():
     print(f"Parts: {part_names}")
     
     # Get transformation from AprilTag base to robot base
-    robot_from_april = np.linalg.inv(config["robot"]["tag_base_from_robot_base"])
+    robot_from_april = config["robot"]["tag_base_from_robot_base"]
     print(f"\nRobot base transformation:")
     print(f"  tag_base_from_robot_base:\n{config['robot']['tag_base_from_robot_base']}")
     print(f"  robot_from_april (inverse):\n{robot_from_april}")
