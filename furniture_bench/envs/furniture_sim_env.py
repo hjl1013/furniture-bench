@@ -41,7 +41,8 @@ from furniture_bench.envs.observation import (
 from furniture_bench.robot.robot_state import ROBOT_STATE_DIMS
 from furniture_bench.furniture.parts.part import Part
 
-
+import viser
+from viser.extras import ViserUrdf
 ASSET_ROOT = str(Path(__file__).parent.parent.absolute() / "assets")
 
 
@@ -69,6 +70,7 @@ class FurnitureSimEnv(gym.Env):
         record: bool = False,
         max_env_steps: int = 3000,
         act_rot_repr: str = "quat",
+        use_viser: bool = False,
         **kwargs,
     ):
         """
@@ -92,6 +94,7 @@ class FurnitureSimEnv(gym.Env):
             record (bool): If true, videos of the wrist and front cameras' RGB inputs are recorded.
             max_env_steps (int): Maximum number of steps per episode (default: 3000).
             act_rot_repr (str): Representation of rotation for action space. Options are 'quat', 'axis', or 'rot_6d'.
+            use_viser (bool): If true, use Viser for rendering.
         """
         super(FurnitureSimEnv, self).__init__()
         self.device = torch.device("cuda", compute_device_id)
@@ -149,6 +152,7 @@ class FurnitureSimEnv(gym.Env):
             gymapi.SimType.SIM_PHYSX,
             sim_config["sim_params"],
         )
+        self.use_viser = use_viser
         self._create_ground_plane()
         self._setup_lights()
         self.import_assets()
@@ -157,10 +161,18 @@ class FurnitureSimEnv(gym.Env):
         self.set_camera()
         self.acquire_base_tensors()
 
+        # Load objects into viser if not headless
+        if not self.headless and self.viser_server is not None:
+            self._load_viser_objects()
+
         self.isaac_gym.prepare_sim(self.sim)
         self.refresh()
 
         self.isaac_gym.refresh_actor_root_state_tensor(self.sim)
+
+        # Update viser objects with initial state
+        if not self.headless and self.viser_server is not None:
+            self._update_viser_objects()
 
         self.init_ee_pos, self.init_ee_quat = self.get_ee_pose()
 
@@ -242,6 +254,10 @@ class FurnitureSimEnv(gym.Env):
         self.base_idxs = []
         self.part_idxs = {}
         self.franka_handles = []
+        # Store indices for fixed objects (table, base_tag, background)
+        self.table_idxs = []
+        self.base_tag_idxs = []
+        self.background_idxs = []
         for i in range(self.num_envs):
             env = self.isaac_gym.create_env(self.sim, env_lower, env_upper, num_per_row)
             self.envs.append(env)
@@ -259,6 +275,11 @@ class FurnitureSimEnv(gym.Env):
             self.isaac_gym.set_actor_rigid_shape_properties(
                 env, table_handle, table_props
             )
+            # Store table index
+            table_idx = self.isaac_gym.get_actor_rigid_body_index(
+                env, table_handle, 0, gymapi.DOMAIN_SIM
+            )
+            self.table_idxs.append(table_idx)
 
             self.base_tag_pose = gymapi.Transform()
             base_tag_pos = T.pos_from_mat(config["robot"]["tag_base_from_robot_base"])
@@ -269,12 +290,23 @@ class FurnitureSimEnv(gym.Env):
             base_tag_handle = self.isaac_gym.create_actor(
                 env, self.base_tag_asset, self.base_tag_pose, "base_tag", i, 0
             )
+            # Store base_tag index
+            base_tag_idx = self.isaac_gym.get_actor_rigid_body_index(
+                env, base_tag_handle, 0, gymapi.DOMAIN_SIM
+            )
+            self.base_tag_idxs.append(base_tag_idx)
+            
             bg_pos = gymapi.Vec3(-0.8, 0, 0.75)
             bg_pose = gymapi.Transform()
             bg_pose.p = gymapi.Vec3(bg_pos.x, bg_pos.y, bg_pos.z)
             bg_handle = self.isaac_gym.create_actor(
                 env, self.background_asset, bg_pose, "background", i, 0
             )
+            # Store background index
+            bg_idx = self.isaac_gym.get_actor_rigid_body_index(
+                env, bg_handle, 0, gymapi.DOMAIN_SIM
+            )
+            self.background_idxs.append(bg_idx)
             # TODO: Make config
             obstacle_pose = gymapi.Transform()
             obstacle_pose.p = gymapi.Vec3(
@@ -487,8 +519,26 @@ class FurnitureSimEnv(gym.Env):
         """Create the viewer."""
         self.enable_viewer_sync = True
         self.viewer = None
-
-        if not self.headless:
+        self.viser_server = None
+        self.viser_objects = {}
+        if not self.headless and self.use_viser:
+            # Create viser server instead of Isaac Gym viewer
+            self.viser_server = viser.ViserServer()
+            # Set camera position (similar to Isaac Gym viewer)
+            # Note: viser uses different coordinate conventions, may need adjustment
+            self.viser_server.scene.set_up_direction("+z")
+            # Store camera position for later use
+            self.viser_cam_pos = np.array([0.97, 0, 0.74])
+            self.viser_cam_target = np.array([-1, 0, 0.62])
+            
+            # Add grid for reference
+            self.viser_server.scene.add_grid(
+                "/grid",
+                width=4.0,
+                height=4.0,
+                position=(0.0, 0.0, 0.0),
+            )
+        elif not self.headless:
             self.viewer = self.isaac_gym.create_viewer(
                 self.sim, gymapi.CameraProperties()
             )
@@ -499,15 +549,273 @@ class FurnitureSimEnv(gym.Env):
             self.isaac_gym.viewer_camera_look_at(
                 self.viewer, middle_env, cam_pos, cam_target
             )
+    def _load_viser_objects(self):
+        """Load all objects (robot, furniture parts, table, etc.) into viser."""
+        if self.viser_server is None:
+            return
+        
+        # Initialize viser_objects dictionary
+        self.viser_objects = {
+            "franka": [],
+            "parts": {},
+            "table": [],
+            "base_tag": [],
+            "background": [],
+            "obstacle_front": [],
+            "obstacle_left": [],
+            "obstacle_right": [],
+        }
+        
+        # Load Franka robot for each environment
+        franka_urdf_path = Path(ASSET_ROOT) / self.franka_asset_file
+        for env_idx in range(self.num_envs):
+            # Create base frame for robot
+            robot_base_name = f"/env_{env_idx}/franka_base"
+            robot_base_frame = self.viser_server.scene.add_frame(
+                robot_base_name, show_axes=False
+            )
+            
+            # Initial robot base pose will be set from Isaac Gym state
+            # Set placeholder for now - this ensures poses match exactly
+            robot_base_frame.position = (0.0, 0.0, 0.0)
+            robot_base_frame.wxyz = (1.0, 0.0, 0.0, 0.0)
+            
+            # Load Franka URDF
+            franka_urdf = ViserUrdf(
+                self.viser_server,
+                urdf_or_path=franka_urdf_path,
+                root_node_name=robot_base_name,
+                load_meshes=True,
+                load_collision_meshes=False,
+            )
+            
+
+            
+            self.viser_objects["franka"].append({
+                "base_frame": robot_base_frame,
+                "urdf": franka_urdf,
+            })
+        
+        # Load furniture parts for each environment
+        for part in self.furniture.parts:
+            part_urdf_path = Path(ASSET_ROOT) / part.asset_file
+            self.viser_objects["parts"][part.name] = []
+            
+            for env_idx in range(self.num_envs):
+                part_frame_name = f"/env_{env_idx}/parts/{part.name}"
+                part_frame = self.viser_server.scene.add_frame(
+                    part_frame_name, show_axes=False
+                )
+                # Initial pose will be set from Isaac Gym state
+                part_frame.position = (0.0, 0.0, 0.0)
+                part_frame.wxyz = (1.0, 0.0, 0.0, 0.0)
+                
+                # Load part URDF
+                part_urdf = ViserUrdf(
+                    self.viser_server,
+                    urdf_or_path=part_urdf_path,
+                    root_node_name=part_frame_name,
+                    load_meshes=True,
+                    load_collision_meshes=False,
+                )
+                
+                self.viser_objects["parts"][part.name].append({
+                    "frame": part_frame,
+                    "urdf": part_urdf,
+                })
+        
+        # Load table, base_tag, background, obstacles for each environment
+        table_urdf_path = Path(ASSET_ROOT) / "furniture/urdf/table.urdf"
+        base_tag_urdf_path = Path(ASSET_ROOT) / "furniture/urdf/base_tag.urdf"
+        background_urdf_path = Path(ASSET_ROOT) / "furniture/urdf/background.urdf"
+        obstacle_front_urdf_path = Path(ASSET_ROOT) / "furniture/urdf/obstacle_front.urdf"
+        obstacle_side_urdf_path = Path(ASSET_ROOT) / "furniture/urdf/obstacle_side.urdf"
+        
+        # Load objects with placeholder poses - they will be updated from Isaac Gym state
+        # This ensures poses match exactly what's in the simulation
+        for env_idx in range(self.num_envs):
+            env_prefix = f"/env_{env_idx}"
+            
+            # Table
+            table_frame_name = f"{env_prefix}/table"
+            table_frame = self.viser_server.scene.add_frame(
+                table_frame_name, show_axes=False
+            )
+            # Initial pose will be set from Isaac Gym state
+            table_frame.position = (0.0, 0.0, 0.0)
+            table_frame.wxyz = (1.0, 0.0, 0.0, 0.0)
+            table_urdf = ViserUrdf(
+                self.viser_server,
+                urdf_or_path=table_urdf_path,
+                root_node_name=table_frame_name,
+                load_meshes=True,
+                load_collision_meshes=False,
+            )
+            self.viser_objects["table"].append({
+                "frame": table_frame,
+                "urdf": table_urdf,
+            })
+            
+            # Base tag
+            base_tag_frame_name = f"{env_prefix}/base_tag"
+            base_tag_frame = self.viser_server.scene.add_frame(
+                base_tag_frame_name, show_axes=False
+            )
+            base_tag_frame.position = (0.0, 0.0, 0.0)
+            base_tag_frame.wxyz = (1.0, 0.0, 0.0, 0.0)
+            base_tag_urdf = ViserUrdf(
+                self.viser_server,
+                urdf_or_path=base_tag_urdf_path,
+                root_node_name=base_tag_frame_name,
+                load_meshes=True,
+                load_collision_meshes=False,
+            )
+            self.viser_objects["base_tag"].append({
+                "frame": base_tag_frame,
+                "urdf": base_tag_urdf,
+            })
+            
+            # Background
+            background_frame_name = f"{env_prefix}/background"
+            background_frame = self.viser_server.scene.add_frame(
+                background_frame_name, show_axes=False
+            )
+            background_frame.position = (0.0, 0.0, 0.0)
+            background_frame.wxyz = (1.0, 0.0, 0.0, 0.0)
+            background_urdf = ViserUrdf(
+                self.viser_server,
+                urdf_or_path=background_urdf_path,
+                root_node_name=background_frame_name,
+                load_meshes=True,
+                load_collision_meshes=False,
+            )
+            self.viser_objects["background"].append({
+                "frame": background_frame,
+                "urdf": background_urdf,
+            })
+            
+            # Obstacles
+            for obs_name in ["obstacle_front", "obstacle_right", "obstacle_left"]:
+                obs_frame_name = f"{env_prefix}/{obs_name}"
+                obs_frame = self.viser_server.scene.add_frame(
+                    obs_frame_name, show_axes=False
+                )
+                obs_frame.position = (0.0, 0.0, 0.0)
+                obs_frame.wxyz = (1.0, 0.0, 0.0, 0.0)
+                obs_urdf_path = obstacle_front_urdf_path if obs_name == "obstacle_front" else obstacle_side_urdf_path
+                obs_urdf = ViserUrdf(
+                    self.viser_server,
+                    urdf_or_path=obs_urdf_path,
+                    root_node_name=obs_frame_name,
+                    load_meshes=True,
+                    load_collision_meshes=False,
+                )
+                self.viser_objects[obs_name].append({
+                    "frame": obs_frame,
+                    "urdf": obs_urdf,
+                })
+
+    def _update_viser_objects(self):
+        """Update viser objects based on current Isaac Gym state."""
+        if self.viser_server is None or not hasattr(self, 'viser_objects'):
+            return
+        
+        # Refresh Isaac Gym state
+        self.isaac_gym.refresh_rigid_body_state_tensor(self.sim)
+        self.isaac_gym.refresh_dof_state_tensor(self.sim)
+        
+        # Update Franka robots
+        for env_idx in range(self.num_envs):
+            if env_idx >= len(self.viser_objects["franka"]):
+                continue
+            
+            franka_obj = self.viser_objects["franka"][env_idx]
+            base_frame = franka_obj["base_frame"]
+            franka_urdf = franka_obj["urdf"]
+            # Update robot base pose (should be fixed, but update anyway)
+            base_pos = self.rb_states[self.base_idxs[env_idx], :3].cpu().numpy()
+            base_quat = self.rb_states[self.base_idxs[env_idx], 3:7].cpu().numpy()
+            base_frame.position = tuple(base_pos)
+            # Convert quaternion from (x, y, z, w) to (w, x, y, z)
+            base_frame.wxyz = (base_quat[3], base_quat[0], base_quat[1], base_quat[2])
+            
+            # Update robot joint configuration
+            # Get joint positions (first 7 joints for arm, ignore gripper for now)
+            joint_positions = self.dof_pos[env_idx, :8].cpu().numpy()
+            franka_urdf.update_cfg(joint_positions)
+        # Update furniture parts
+        for part_name, part_objs in self.viser_objects["parts"].items():
+            if part_name not in self.part_idxs:
+                continue
+            for env_idx in range(self.num_envs):
+                if env_idx >= len(part_objs) or env_idx >= len(self.part_idxs[part_name]):
+                    continue
+                
+                part_obj = part_objs[env_idx]
+                part_frame = part_obj["frame"]
+                part_idx = self.part_idxs[part_name][env_idx]
+                
+                # Get part pose from Isaac Gym
+                part_pos = self.rb_states[part_idx, :3].cpu().numpy()
+                part_quat = self.rb_states[part_idx, 3:7].cpu().numpy()
+                part_frame.position = tuple(part_pos)
+                # Convert quaternion from (x, y, z, w) to (w, x, y, z)
+                part_frame.wxyz = (part_quat[3], part_quat[0], part_quat[1], part_quat[2])
+        
+        # Update table, base_tag, background, obstacles (fixed objects)
+        for env_idx in range(self.num_envs):
+            if env_idx >= len(self.table_idxs):
+                continue
+            
+            # Update table
+            if env_idx < len(self.viser_objects["table"]):
+                table_obj = self.viser_objects["table"][env_idx]
+                table_idx = self.table_idxs[env_idx]
+                table_pos = self.rb_states[table_idx, :3].cpu().numpy()
+                table_quat = self.rb_states[table_idx, 3:7].cpu().numpy()
+                table_obj["frame"].position = tuple(table_pos)
+                table_obj["frame"].wxyz = (table_quat[3], table_quat[0], table_quat[1], table_quat[2])
+            
+            # Update base_tag
+            if env_idx < len(self.viser_objects["base_tag"]):
+                base_tag_obj = self.viser_objects["base_tag"][env_idx]
+                base_tag_idx = self.base_tag_idxs[env_idx]
+                base_tag_pos = self.rb_states[base_tag_idx, :3].cpu().numpy()
+                base_tag_quat = self.rb_states[base_tag_idx, 3:7].cpu().numpy()
+                base_tag_obj["frame"].position = tuple(base_tag_pos)
+                base_tag_obj["frame"].wxyz = (base_tag_quat[3], base_tag_quat[0], base_tag_quat[1], base_tag_quat[2])
+            
+            # Update background
+            if env_idx < len(self.viser_objects["background"]):
+                bg_obj = self.viser_objects["background"][env_idx]
+                bg_idx = self.background_idxs[env_idx]
+                bg_pos = self.rb_states[bg_idx, :3].cpu().numpy()
+                bg_quat = self.rb_states[bg_idx, 3:7].cpu().numpy()
+                bg_obj["frame"].position = tuple(bg_pos)
+                bg_obj["frame"].wxyz = (bg_quat[3], bg_quat[0], bg_quat[1], bg_quat[2])
+            
+            # Update obstacles (already in part_idxs)
+            for obs_name in ["obstacle_front", "obstacle_left", "obstacle_right"]:
+                if obs_name not in self.part_idxs or env_idx >= len(self.viser_objects[obs_name]):
+                    continue
+                if env_idx >= len(self.part_idxs[obs_name]):
+                    continue
+                obs_obj = self.viser_objects[obs_name][env_idx]
+                obs_idx = self.part_idxs[obs_name][env_idx]
+                obs_pos = self.rb_states[obs_idx, :3].cpu().numpy()
+                obs_quat = self.rb_states[obs_idx, 3:7].cpu().numpy()
+                obs_obj["frame"].position = tuple(obs_pos)
+                obs_obj["frame"].wxyz = (obs_quat[3], obs_quat[0], obs_quat[1], obs_quat[2])
 
     def set_camera(self):
         self.camera_handles = {}
-        self.camera_obs = {}
+        # Store mapping from obs_key to list of (camera_handle, env_idx, render_type) tuples
+        self.camera_obs_config = {}
 
         def create_camera(name, i):
             env = self.envs[i]
             camera_cfg = gymapi.CameraProperties()
-            camera_cfg.enable_tensors = True
+            camera_cfg.enable_tensors = False
             camera_cfg.width = self.img_size[0]
             camera_cfg.height = self.img_size[1]
             camera_cfg.near_plane = 0.001
@@ -565,14 +873,10 @@ class FurnitureSimEnv(gym.Env):
                 if len(self.camera_handles[camera_name]) <= env_idx:
                     self.camera_handles[camera_name].append(create_camera(camera_name, env_idx))
                 handle = self.camera_handles[camera_name][env_idx]
-                tensor = gymtorch.wrap_tensor(
-                    self.isaac_gym.get_camera_image_gpu_tensor(
-                        self.sim, env, handle, render_type
-                    )
-                )
-                if k not in self.camera_obs:
-                    self.camera_obs[k] = []
-                self.camera_obs[k].append(tensor)
+                # Store configuration for fetching images later
+                if k not in self.camera_obs_config:
+                    self.camera_obs_config[k] = []
+                self.camera_obs_config[k].append((handle, env_idx, render_type))
 
     def import_assets(self):
         self.base_tag_asset = self._import_base_tag_asset()
@@ -808,13 +1112,20 @@ class FurnitureSimEnv(gym.Env):
             self.isaac_gym.set_dof_actuation_force_tensor(
                 self.sim, gymtorch.unwrap_tensor(torque_action)
             )
-
+            # Update viser visualization
+            if not self.headless and self.viser_server is not None:
+                self._update_viser_objects()
             # Update viewer
-            if not self.headless:
+            elif not self.headless:
                 self.isaac_gym.draw_viewer(self.viewer, self.sim, False)
                 self.isaac_gym.sync_frame_time(self.sim)
 
-        self.isaac_gym.end_access_image_tensors(self.sim)
+
+
+        # Fetch results, step graphics, and render cameras before getting observation
+        self.isaac_gym.fetch_results(self.sim, True)
+        self.isaac_gym.step_graphics(self.sim)
+        self.isaac_gym.render_all_camera_sensors(self.sim)
 
         obs = self._get_observation()
         self.env_steps += 1
@@ -962,8 +1273,7 @@ class FurnitureSimEnv(gym.Env):
         self.isaac_gym.refresh_rigid_body_state_tensor(self.sim)
         self.isaac_gym.refresh_jacobian_tensors(self.sim)
         self.isaac_gym.refresh_mass_matrix_tensors(self.sim)
-        self.isaac_gym.render_all_camera_sensors(self.sim)
-        self.isaac_gym.start_access_image_tensors(self.sim)
+
 
     def init_ctrl(self):
         # Positional and velocity gains for robot control.
@@ -1077,15 +1387,37 @@ class FurnitureSimEnv(gym.Env):
         return P, V
 
     def _get_observation(self):
+        # Ensure cameras are rendered before fetching images
+        self.isaac_gym.fetch_results(self.sim, True)
+        self.isaac_gym.step_graphics(self.sim)
+        self.isaac_gym.render_all_camera_sensors(self.sim)
         robot_state = self._read_robot_state()
-        color_obs = {
-            k: self._get_color_obs(v)
-            for k, v in self.camera_obs.items()
-            if "color" in k
-        }
-        depth_obs = {
-            k: torch.stack(v) for k, v in self.camera_obs.items() if "depth" in k
-        }
+        # Fetch camera images for each observation key
+        color_obs = {}
+        depth_obs = {}
+        for k, configs in self.camera_obs_config.items():
+            images = []
+            for handle, env_idx, render_type in configs:
+                env = self.envs[env_idx]
+                image = self.isaac_gym.get_camera_image(
+                    self.sim, env, handle, render_type
+                )
+                
+                # Reshape the flat array returned by get_camera_image()
+                if render_type == gymapi.IMAGE_COLOR:
+                    # Color images are RGBA: (height, width, 4)
+                    image = np.reshape(image, (self.img_size[1], self.img_size[0], 4))
+                elif render_type == gymapi.IMAGE_DEPTH:
+                    # Depth images: (height, width)
+                    image = np.reshape(image, (self.img_size[1], self.img_size[0]))
+                
+                tensor = torch.from_numpy(image).to(device=self.device)
+                images.append(tensor)
+            
+            if "color" in k:
+                color_obs[k] = self._get_color_obs(images)
+            elif "depth" in k:
+                depth_obs[k] = torch.stack(images)
 
         if self.np_step_out:
             robot_state = {k: v.cpu().numpy() for k, v in robot_state.items()}
