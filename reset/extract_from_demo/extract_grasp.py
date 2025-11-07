@@ -1118,7 +1118,7 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Save summary.json
-        summary_path = output_dir / "summary.json"
+        summary_path = output_dir / "grasp_summary.json"
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         print(f"\nSaved summary to {summary_path}")
@@ -1141,7 +1141,7 @@ def main():
             return json_store
         
         # Save aggregate_store.json
-        aggregate_store_path = output_dir / "aggregate_store.json"
+        aggregate_store_path = output_dir / "grasps.json"
         json_aggregate_store = convert_aggregate_store(aggregate_store)
         with open(aggregate_store_path, "w", encoding="utf-8") as f:
             json.dump(json_aggregate_store, f, indent=2)
