@@ -29,8 +29,8 @@ try:
     from reset.extract_from_demo.extract_grasp import TRIMESH_AVAILABLE
 except Exception:
     try:
-        from .extract_grasp import _trimesh_to_open3d, _ensure_open3d, _load_part_mesh_trimesh
-        from .extract_grasp import TRIMESH_AVAILABLE
+        from reset.extract_from_demo.extract_grasp import _trimesh_to_open3d, _ensure_open3d, _load_part_mesh_trimesh
+        from reset.extract_from_demo.extract_grasp import TRIMESH_AVAILABLE
     except Exception:
         _trimesh_to_open3d = None
         _ensure_open3d = None
