@@ -6,6 +6,7 @@ from pathlib import Path
 
 import cv2
 import gym
+import numpy as np
 import torch
 from joblib import Parallel, delayed
 
@@ -15,6 +16,7 @@ from furniture_bench.config import config
 from furniture_bench.sim_config import sim_config
 from furniture_bench.perception.image_utils import resize, resize_crop
 from furniture_bench.envs.initialization_mode import Randomness
+from furniture_bench.utils.action_utils import delta_to_absolute
 
 
 class DataCollector:
@@ -40,6 +42,7 @@ class DataCollector:
         num_demos: int = 100,
         resize_sim_img: bool = False,
         gripper_pos_control: bool = False,
+        absolute_action: bool = False,
     ):
         """
         Args:
@@ -109,6 +112,10 @@ class DataCollector:
         self.pkl_only = pkl_only
         self.save_failure = save_failure
         self.resize_sim_img = resize_sim_img
+        self.absolute_action = absolute_action
+
+        base_env = getattr(self.env, "unwrapped", self.env)
+        self.act_rot_repr = getattr(base_env, "act_rot_repr", "quat")
 
         self._reset_collector_buffer()
 
@@ -234,6 +241,14 @@ class DataCollector:
                         action = action.squeeze().cpu().numpy()
                     else:
                         action = action.squeeze()
+                if self.absolute_action:
+                    robot_state = obs["robot_state"]
+                    action = delta_to_absolute(
+                         np.asarray(action).squeeze(),
+                        robot_state["ee_pos"],
+                        robot_state["ee_quat"],
+                        self.act_rot_repr,
+                    )
                 self.acts.append(action)
                 self.rews.append(rew)
                 self.skills.append(skill_complete)

@@ -105,12 +105,16 @@ def main():
             new_traj["rewards"] = data["rewards"].copy()
             new_traj["skills"] = data["skills"].copy()
 
-            # Skip no action.
-            no_action = np.array([0, 0, 0, 0, 0, 0, 1, -1], dtype=np.float32)
+            # Skip initial repeated action (no movement).
+            no_action = (
+                new_traj["actions"][0].copy() if len(new_traj["actions"]) > 0 else None
+            )
             len_traj = len(data["actions"])
             num_skipped = 0
             for i in range(len_traj):
-                if np.isclose(new_traj["actions"][i], no_action).all():
+                if no_action is not None and np.isclose(
+                    new_traj["actions"][i], no_action
+                ).all():
                     num_skipped += 1
                 else:
                     break

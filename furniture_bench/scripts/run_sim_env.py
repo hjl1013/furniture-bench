@@ -10,6 +10,8 @@ import cv2
 import torch
 import numpy as np
 
+from furniture_bench.utils.action_utils import absolute_to_delta
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -94,17 +96,30 @@ def main():
         help="Use Viser for rendering.",
     )
 
+    parser.add_argument(
+        "--reverse-action",
+        action="store_true",
+        help="Reverse the action trajectory.",
+    )
+    parser.add_argument(
+        "--absolute-action",
+        action="store_true",
+        help="Treat replayed actions as absolute end-effector targets.",
+    )
+
+    parser.add_argument("--seed", default=0, type=int)
+
     parser.add_argument("--num-envs", type=int, default=1)
     args = parser.parse_args()
 
-    # INSERT_YOUR_CODE
+    # Set seed.
     import random
     import numpy as np
     import torch
 
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     # Create FurnitureSim environment.
     env = gym.make(
@@ -136,6 +151,22 @@ def main():
         if len(ac.shape) == 1:
             ac = ac[None]
         return ac.tile(args.num_envs, 1).float().to(env.device)
+
+    def _to_numpy(array):
+        if isinstance(array, torch.Tensor):
+            return array.detach().cpu().numpy().squeeze()
+        return np.asarray(array).squeeze()
+
+    def to_delta_action(abs_action, robot_state):
+        ee_pos = _to_numpy(robot_state["ee_pos"])
+        ee_quat = _to_numpy(robot_state["ee_quat"])
+        return absolute_to_delta(_to_numpy(abs_action), ee_pos, ee_quat, args.act_rot_repr)
+
+    def prepare_action(action, robot_state):
+        if args.absolute_action:
+            delta = to_delta_action(action, robot_state)
+            return action_tensor(delta)
+        return action_tensor(action)
 
     # Rollout one episode with a selected policy:
     if args.input_device is not None:
@@ -170,22 +201,32 @@ def main():
         with open(args.file_path, "rb") as f:
             data = pickle.load(f)
         for ac in data["actions"]:
-            ac = action_tensor(ac)
-            env.step(ac)
+            ac_tensor = prepare_action(ac, ob["robot_state"])
+            ob, rew, done, _ = env.step(ac_tensor)
     elif args.scripted:
         # Execute hard-coded assembly script.
         while not done:
             action, skill_complete = env.get_assembly_action()
             action = action_tensor(action)
             ob, rew, done, _ = env.step(action)
+    elif args.replay_path and args.reverse_action:
+        # Replay the trajectory in reverse.
+        with open(args.replay_path, "rb") as f:
+            data = pickle.load(f)
+        env.reset_to([data["observations"][-1]])  # reset to the last observation.
+        ob = env.get_observation()
+        for ac in reversed(data["actions"]):
+            ac_tensor = prepare_action(ac, ob["robot_state"])
+            ob, rew, done, _ = env.step(ac_tensor)
     elif args.replay_path:
         # Replay the trajectory.
         with open(args.replay_path, "rb") as f:
             data = pickle.load(f)
         env.reset_to([data["observations"][0]])  # reset to the first observation.
+        ob = env.get_observation()
         for ac in data["actions"]:
-            ac = action_tensor(ac)
-            ob, rew, done, _ = env.step(ac)
+            ac_tensor = prepare_action(ac, ob["robot_state"])
+            ob, rew, done, _ = env.step(ac_tensor)
     else:
         raise ValueError(f"No action specified")
 

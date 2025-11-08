@@ -76,9 +76,24 @@ def main():
 
     parser.add_argument("--resize-sim-img", action="store_true")
     parser.add_argument("--gripper-pos-control", action="store_true")
+    parser.add_argument(
+        "--absolute-action",
+        action="store_true",
+        help="Store actions as absolute end-effector targets.",
+    )
+
+    parser.add_argument("--seed", default=0, type=int)
 
 
     args = parser.parse_args()
+
+    import random
+    import numpy as np
+    import torch
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     if args.scripted:
         assert args.is_sim
@@ -107,6 +122,7 @@ def main():
         num_demos=args.num_demos,
         resize_sim_img=args.resize_sim_img,
         gripper_pos_control=args.gripper_pos_control,
+        absolute_action=args.absolute_action,
     )
     data_collector.collect()
 
