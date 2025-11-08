@@ -73,7 +73,7 @@ from reset.scripts.get_info import get_object_affordance
 trajectory = get_object_affordance(
             base_part="cabinet_body,
             target_part="cabinet_door_left,
-            furniture_name="cabinet,
+            furniture_name="cabinet",
             mode=0
         )
 ```
