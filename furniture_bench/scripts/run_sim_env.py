@@ -97,15 +97,6 @@ def main():
     parser.add_argument("--num-envs", type=int, default=1)
     args = parser.parse_args()
 
-    # INSERT_YOUR_CODE
-    import random
-    import numpy as np
-    import torch
-
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
-
     # Create FurnitureSim environment.
     env = gym.make(
         args.env_id,
