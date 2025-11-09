@@ -10,7 +10,15 @@ import cv2
 import torch
 import numpy as np
 
-from furniture_bench.utils.action_utils import absolute_to_delta
+from furniture_bench.utils.action_utils import (
+    absolute_to_delta,
+    delta_to_absolute,
+    _quat_to_repr,
+    _repr_to_quat,
+)
+import furniture_bench.utils.transform as T
+from furniture_bench.config import config
+
 
 
 def main():
@@ -107,6 +115,11 @@ def main():
         help="Treat replayed actions as absolute end-effector targets.",
     )
 
+    parser.add_argument(
+        "--poc1",
+        action="store_true",
+        help="Use POC1 for the replay.",
+    )
     parser.add_argument("--seed", default=0, type=int)
 
     parser.add_argument("--num-envs", type=int, default=1)
@@ -209,15 +222,92 @@ def main():
             action, skill_complete = env.get_assembly_action()
             action = action_tensor(action)
             ob, rew, done, _ = env.step(action)
-    elif args.replay_path and args.reverse_action:
+    elif args.replay_path and args.reverse_action and args.poc1:
         # Replay the trajectory in reverse.
         with open(args.replay_path, "rb") as f:
             data = pickle.load(f)
         env.reset_to([data["observations"][-1]])  # reset to the last observation.
         ob = env.get_observation()
-        for ac in reversed(data["actions"]):
-            ac_tensor = prepare_action(ac, ob["robot_state"])
-            ob, rew, done, _ = env.step(ac_tensor)
+        parts_names = [part.name for part in env.furniture.parts]
+        with open("extracted_info.pkl", "rb") as f:
+            extracted_info = pickle.load(f)
+
+        robot_from_april = config["robot"]["tag_base_from_robot_base"]
+        april_from_robot = np.linalg.inv(robot_from_april)
+
+        actions_info = extracted_info["actions"]
+        action_idx = extracted_info["num_actions"] - 1
+        for i,ac in enumerate(reversed(data["actions"])):
+            timestep = len(data["actions"]) - i
+            print(timestep)
+            while action_idx >= 0 and timestep < actions_info[action_idx]["start_step"]:
+                action_idx -= 1
+
+            if action_idx < 0:
+                ac_tensor = prepare_action(ac, ob["robot_state"])
+                ob, rew, done, _ = env.step(ac_tensor)
+                continue
+
+            action_info = actions_info[action_idx]
+
+            if timestep > action_info["end_step"]:
+                if action_info["type"] == "INTERACT":
+                    base_part = action_info["base_part"]
+                    target_part = action_info["target_part"]
+                    parts_array = _to_numpy(ob["parts_poses"]).reshape(len(parts_names), 7)
+                    current_base_part_pose = parts_array[parts_names.index(base_part)]
+                    current_target_part_pose = parts_array[parts_names.index(target_part)]
+                    desired_target_part_pose = action_info["target_end_pose"]
+                    # compute the relative pose between the current target part pose and the desired target part pose
+                    # then transform ac with the relative pose
+                    current_target_part_pose = _to_numpy(current_target_part_pose)
+                    desired_target_part_pose = _to_numpy(desired_target_part_pose)
+                    current_target_mat = T.pose2mat(current_target_part_pose)
+                    desired_target_mat = T.pose2mat(desired_target_part_pose)
+                    relative_transform = current_target_mat @ np.linalg.inv(desired_target_mat)
+                    print(relative_transform)
+                    robot_state = ob["robot_state"]
+                    ee_pos = _to_numpy(robot_state["ee_pos"])
+                    ee_quat = _to_numpy(robot_state["ee_quat"])
+
+                    ac_np = _to_numpy(ac)
+                    if args.absolute_action:
+                        absolute_action = ac_np.copy()
+                    else:
+                        absolute_action = delta_to_absolute(ac_np, ee_pos, ee_quat, args.act_rot_repr)
+
+                    absolute_quat = _repr_to_quat(absolute_action[3:-1], args.act_rot_repr)
+                    absolute_pose_vec = np.concatenate([absolute_action[:3], absolute_quat])
+                    absolute_pose_mat_robot = T.pose2mat(absolute_pose_vec)
+                    absolute_pose_mat_april = april_from_robot @ absolute_pose_mat_robot
+
+                    transformed_pose_mat_april = relative_transform @ absolute_pose_mat_april
+                    transformed_pose_mat_robot = robot_from_april @ transformed_pose_mat_april
+
+                    transformed_pos, transformed_quat = T.mat2pose(transformed_pose_mat_robot)
+                    transformed_rot_repr = _quat_to_repr(transformed_quat, args.act_rot_repr)
+                    transformed_absolute_action = np.concatenate(
+                        [transformed_pos, transformed_rot_repr, np.array([absolute_action[-1]])]
+                    )
+
+                    if args.absolute_action:
+                        ac = transformed_absolute_action
+                    else:
+                        ac = absolute_to_delta(
+                            transformed_absolute_action, ee_pos, ee_quat, args.act_rot_repr
+                        )
+                elif action_info["type"] == "MOVE":
+                    breakpoint()
+            control_cnt = 0
+            while not np.allclose(_to_numpy(ob["robot_state"]["ee_pos"]), ac[:3], atol=5e-2) or not np.allclose(_to_numpy(ob["robot_state"]["ee_quat"]), ac[3:7], atol=1e-1):
+                ac_tensor = prepare_action(ac, ob["robot_state"])
+                # run until the action is completed
+                ob, rew, done, _ = env.step(ac_tensor)
+                control_cnt += 1
+                if control_cnt > 20:
+                    break
+            # ac_tensor = prepare_action(ac, ob["robot_state"])
+            # ob, rew, done, _ = env.step(ac_tensor)
     elif args.replay_path:
         # Replay the trajectory.
         with open(args.replay_path, "rb") as f:
