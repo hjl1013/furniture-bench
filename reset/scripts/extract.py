@@ -5,8 +5,8 @@ Extracts:
 1. Distances between gripper and parts, and between parts (saved as distances.pkl)
 2. MOVE and INTERACT actions with grasp poses and object affordances (saved as all_in_one_extraction.json and extracted_info.pkl)
 
-MOVE actions include: grasped part, initial/final poses, grasp pose (relative gripper pose)
-INTERACT actions include: target/base parts, initial/final poses, grasp pose, object affordance trajectory
+MOVE actions include: grasped part, initial/final poses, grasp pose (gripper pose relative to part)
+INTERACT actions include: target/base parts, initial/final poses, grasp pose (gripper pose relative to target part), object affordance trajectory
 """
 from pathlib import Path
 import argparse
@@ -307,7 +307,9 @@ def extract_all_in_one(
                     target_pose_mat_robot = robot_from_april @ target_pose_mat_april
                     
                     # Compute grasp pose (relative pose of gripper w.r.t. target part)
-                    rel_pos, rel_quat = compute_relative_pose(ee_pose_mat, target_pose_mat_robot)
+                    # Swap arguments: compute_relative_pose(part, ee) gives gripper in part frame
+                    rel_pos, rel_quat = compute_relative_pose(target_pose_mat_robot, ee_pose_mat)
+                    # Now rel_mat = inv(part_mat) @ ee_mat, which is gripper in part frame
                     
                     current_action = {
                         "type": "INTERACT",
@@ -334,7 +336,9 @@ def extract_all_in_one(
                     grasped_pose_mat_robot = robot_from_april @ grasped_pose_mat_april
                     
                     # Compute grasp pose (relative pose of gripper w.r.t. grasped part)
-                    rel_pos, rel_quat = compute_relative_pose(ee_pose_mat, grasped_pose_mat_robot)
+                    # Swap arguments: compute_relative_pose(part, ee) gives gripper in part frame
+                    rel_pos, rel_quat = compute_relative_pose(grasped_pose_mat_robot, ee_pose_mat)
+                    # Now rel_mat = inv(part_mat) @ ee_mat, which is gripper in part frame
                     
                     current_action = {
                         "type": "MOVE",
@@ -388,7 +392,8 @@ def extract_all_in_one(
                             target_pose_mat_april = T.pose2mat(target_pose_vec)
                             target_pose_mat_robot = robot_from_april @ target_pose_mat_april
                             
-                            rel_pos, rel_quat = compute_relative_pose(ee_pose_mat, target_pose_mat_robot)
+                            # Compute grasp pose: gripper in part frame
+                            rel_pos, rel_quat = compute_relative_pose(target_pose_mat_robot, ee_pose_mat)
                             
                             current_action = {
                                 "type": "INTERACT",
@@ -413,7 +418,8 @@ def extract_all_in_one(
                             grasped_pose_mat_april = T.pose2mat(grasped_pose_vec)
                             grasped_pose_mat_robot = robot_from_april @ grasped_pose_mat_april
                             
-                            rel_pos, rel_quat = compute_relative_pose(ee_pose_mat, grasped_pose_mat_robot)
+                            # Compute grasp pose: gripper in part frame
+                            rel_pos, rel_quat = compute_relative_pose(grasped_pose_mat_robot, ee_pose_mat)
                             
                             current_action = {
                                 "type": "MOVE",
@@ -489,7 +495,8 @@ def extract_all_in_one(
                             target_pose_mat_april = T.pose2mat(target_pose_vec)
                             target_pose_mat_robot = robot_from_april @ target_pose_mat_april
                             
-                            rel_pos, rel_quat = compute_relative_pose(ee_pose_mat, target_pose_mat_robot)
+                            # Compute grasp pose: gripper in part frame
+                            rel_pos, rel_quat = compute_relative_pose(target_pose_mat_robot, ee_pose_mat)
                             
                             current_action = {
                                 "type": "INTERACT",
@@ -514,7 +521,8 @@ def extract_all_in_one(
                             grasped_pose_mat_april = T.pose2mat(grasped_pose_vec)
                             grasped_pose_mat_robot = robot_from_april @ grasped_pose_mat_april
                             
-                            rel_pos, rel_quat = compute_relative_pose(ee_pose_mat, grasped_pose_mat_robot)
+                            # Compute grasp pose: gripper in part frame
+                            rel_pos, rel_quat = compute_relative_pose(grasped_pose_mat_robot, ee_pose_mat)
                             
                             current_action = {
                                 "type": "MOVE",
@@ -606,6 +614,12 @@ def parse_args():
         required=True,
         help="Directory to save output files",
     )
+    parser.add_argument(
+        "--distance",
+        type=Path,
+        default=None,
+        help="Path to pre-computed distances.pkl file. If provided, distances will be loaded instead of computed.",
+    )
     return parser.parse_args()
 
 
@@ -657,18 +671,47 @@ def main():
     print(f"Parts: {part_names}")
     print(f"Include part-part distances: {not args.no_part_part}")
     
-    # Step 1: Extract distances
+    # Step 1: Extract or load distances
     print("\n" + "="*60)
-    print("Step 1: Extracting distances...")
-    print("="*60)
-    distances_data = extract_distances(
-        observations,
-        furniture_name,
-        part_names,
-        thresholds,
-        robot_from_april,
-        include_part_part=not args.no_part_part,
-    )
+    if args.distance is not None:
+        print("Step 1: Loading pre-computed distances...")
+        print("="*60)
+        distance_path = Path(args.distance).expanduser().resolve()
+        if not distance_path.is_file():
+            raise FileNotFoundError(f"Distance file not found: {distance_path}")
+        
+        print(f"Loading distances from: {distance_path}")
+        with open(distance_path, "rb") as f:
+            distances_data = pickle.load(f)
+        
+        # Validate that distances match the current dataset
+        if distances_data.get("furniture") != furniture_name:
+            print(f"Warning: Distance file furniture ({distances_data.get('furniture')}) "
+                  f"does not match current furniture ({furniture_name})")
+        
+        if distances_data.get("part_names") != part_names:
+            print(f"Warning: Distance file part names ({distances_data.get('part_names')}) "
+                  f"do not match current part names ({part_names})")
+        
+        num_frames_in_distances = distances_data.get("num_frames", len(distances_data.get("frames", [])))
+        if num_frames_in_distances != len(observations):
+            print(f"Warning: Distance file has {num_frames_in_distances} frames, "
+                  f"but dataset has {len(observations)} observations")
+        
+        print(f"Loaded distances for {num_frames_in_distances} frames")
+        should_save_distances = False  # Don't overwrite the provided file
+    else:
+        print("Step 1: Extracting distances...")
+        print("="*60)
+        distances_data = extract_distances(
+            observations,
+            furniture_name,
+            part_names,
+            thresholds,
+            robot_from_april,
+            include_part_part=not args.no_part_part,
+        )
+        should_save_distances = True  # Save newly computed distances
     
     # Step 2: Extract actions using distances
     print("\n" + "="*60)
@@ -685,11 +728,14 @@ def main():
     output_dir = Path(args.output)
     os.makedirs(output_dir, exist_ok=True)
     
-    # Save distances.pkl
-    distances_path = output_dir / "distances.pkl"
-    with open(distances_path, "wb") as f:
-        pickle.dump(distances_data, f)
-    print(f"\nSaved distances to {distances_path}")
+    # Save distances.pkl (only if we computed them, not if they were loaded)
+    if should_save_distances:
+        distances_path = output_dir / "distances.pkl"
+        with open(distances_path, "wb") as f:
+            pickle.dump(distances_data, f)
+        print(f"\nSaved distances to {distances_path}")
+    else:
+        print(f"\nSkipping distance save (using pre-computed distances)")
     
     # Prepare extraction data
     extraction_data = {

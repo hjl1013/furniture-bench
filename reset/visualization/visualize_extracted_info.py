@@ -177,6 +177,7 @@ def _add_grasp_pose_to_viser(
         furniture_name: Name of furniture
         part_name: Name of part being grasped
         grasp_pose: Dictionary with "relative_position" and "relative_quaternion"
+                    representing gripper pose relative to part (gripper in part frame)
         action_idx: Index of the action (for unique path naming)
         offset: 3D offset to position this visualization
     """
@@ -243,6 +244,7 @@ def _visualize_grasp_pose(
         furniture_name: Name of furniture
         part_name: Name of part being grasped
         grasp_pose: Dictionary with "relative_position" and "relative_quaternion"
+                    representing gripper pose relative to part (gripper in part frame)
         use_viser: Whether to use viser for visualization (not used here, kept for compatibility)
     """
     if _load_gripper_mesh is None or _load_part_mesh is None:
@@ -267,18 +269,18 @@ def _visualize_grasp_pose(
         print(f"Warning: Could not load part mesh: {e}")
         return
     
-    # Get relative pose
+    # Get relative pose (gripper in part frame)
     rel_pos = np.array(grasp_pose["relative_position"], dtype=np.float64)
     rel_quat = np.array(grasp_pose["relative_quaternion"], dtype=np.float64)
     rel_quat = _quat_normalize(rel_quat)
     
     # Compute transforms
     rel_T = _pose_vec_to_mat(rel_pos, rel_quat)
-    rel_T_inv = np.linalg.inv(rel_T)
+    # rel_T now represents gripper in part frame (no inverse needed)
     
     # Part at origin, gripper positioned relative to part
     part_T = np.eye(4)
-    ee_T = part_T @ rel_T_inv
+    ee_T = part_T @ rel_T  # gripper_pose = part_pose @ (gripper_in_part)
     
     o3d = _ensure_open3d()
     
@@ -805,18 +807,18 @@ def main():
                     if isinstance(part_conf, dict) and "asset_file" in part_conf:
                         part_mesh_o3d = _load_part_mesh(part_conf["asset_file"])
                         
-                        # Get relative pose
+                        # Get relative pose (gripper in part frame)
                         rel_pos = np.array(grasp_pose["relative_position"], dtype=np.float64)
                         rel_quat = np.array(grasp_pose["relative_quaternion"], dtype=np.float64)
                         rel_quat = _quat_normalize(rel_quat)
                         
                         # Compute transforms - center at origin
                         rel_T = _pose_vec_to_mat(rel_pos, rel_quat)
-                        rel_T_inv = np.linalg.inv(rel_T)
+                        # rel_T now represents gripper in part frame (no inverse needed)
                         
                         # Part at origin, gripper positioned relative to part
                         part_T = np.eye(4)  # Centered at origin
-                        ee_T = part_T @ rel_T_inv
+                        ee_T = part_T @ rel_T  # gripper_pose = part_pose @ (gripper_in_part)
                         
                         from reset.visualization.viser_utils import _open3d_to_viser_mesh_data
                         part_mesh_data = _open3d_to_viser_mesh_data(part_mesh_o3d, color=(0.9, 0.7, 0.3))
